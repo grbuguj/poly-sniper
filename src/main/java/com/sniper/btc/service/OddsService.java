@@ -11,17 +11,13 @@ import org.springframework.stereotype.Service;
 
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
-import java.time.format.TextStyle;
-import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 /**
  * ⚡ BTC 5M 전용 오즈 서비스
  *
- * 최적화:
- * - 하나의 마켓만 추적 (BTC 5M up/down)
- * - 500ms 캐시 (poly_bug: 1000ms)
- * - HTTP 타임아웃 2초
+ * poly_bug PolymarketOddsService에서 검증된 slug 방식 사용:
+ *   btc-updown-5m-{epochSecond}
  */
 @Slf4j
 @Service
@@ -37,12 +33,10 @@ public class OddsService {
     // 캐시
     private volatile MarketOdds cachedOdds;
     private volatile long cacheTime;
+    private volatile String cachedSlug = ""; // slug 변경 감지
 
     @Value("${sniper.odds-cache-ttl-ms:500}")
     private long cacheTtlMs;
-
-    @Value("${sniper.http-timeout-ms:2000}")
-    private int httpTimeoutMs;
 
     public OddsService(@Value("${sniper.http-timeout-ms:2000}") int httpTimeoutMs) {
         this.httpClient = new OkHttpClient.Builder()
@@ -64,154 +58,154 @@ public class OddsService {
      * BTC 5M 오즈 조회 (캐시 우선)
      */
     public MarketOdds getOdds() {
+        String currentSlug = buildSlug();
+
+        // slug가 변경됐으면 (새 5분봉) 캐시 무효화
+        if (!currentSlug.equals(cachedSlug)) {
+            cachedOdds = null;
+            cachedSlug = currentSlug;
+        }
+
         if (cachedOdds != null && (System.currentTimeMillis() - cacheTime) < cacheTtlMs) {
             return cachedOdds;
         }
-        return fetchFresh();
+        return fetchFresh(currentSlug);
     }
 
-    private MarketOdds fetchFresh() {
+    private MarketOdds fetchFresh(String slug) {
         long start = System.currentTimeMillis();
         try {
-            // 1단계: Gamma에서 현재 BTC 5M 마켓 찾기
-            String slug = buildSlug();
-            String gammaUrl = GAMMA + "/events?slug=" + slug;
+            // 1. Gamma events API
+            String url = GAMMA + "/events?slug=" + slug;
+            String json = httpGet(url);
+            if (json == null || json.isBlank()) return cachedOdds;
 
-            Request req = new Request.Builder().url(gammaUrl)
-                    .header("Accept", "application/json")
-                    .build();
+            JsonNode events = objectMapper.readTree(json);
+            if (!events.isArray() || events.isEmpty()) {
+                log.debug("events?slug={} → 결과 없음", slug);
+                return cachedOdds;
+            }
 
-            try (Response resp = httpClient.newCall(req).execute()) {
-                if (!resp.isSuccessful() || resp.body() == null) {
-                    log.warn("Gamma API 실패: {}", resp.code());
-                    return cachedOdds; // 이전 캐시 반환
+            JsonNode markets = events.get(0).path("markets");
+            if (!markets.isArray() || markets.isEmpty()) return cachedOdds;
+
+            // 5M은 단일 마켓 — markets[0]
+            JsonNode mkt = markets.get(0);
+            String condId = mkt.path("conditionId").asText("unknown");
+
+            // 토큰 ID 파싱
+            String upTokenId = null, downTokenId = null;
+            String tokenStr = mkt.path("clobTokenIds").asText("[]");
+            try {
+                JsonNode tokens = objectMapper.readTree(tokenStr);
+                if (tokens.isArray() && tokens.size() >= 2) {
+                    upTokenId = tokens.get(0).asText();
+                    downTokenId = tokens.get(1).asText();
                 }
+            } catch (Exception ignored) {}
 
-                JsonNode events = objectMapper.readTree(resp.body().string());
-                if (!events.isArray() || events.isEmpty()) {
-                    return cachedOdds;
-                }
-
-                JsonNode markets = events.get(0).path("markets");
-                if (!markets.isArray() || markets.isEmpty()) {
-                    return cachedOdds;
-                }
-
-                // "Up" 마켓 찾기
-                for (JsonNode mkt : markets) {
-                    String groupTitle = mkt.path("groupItemTitle").asText("");
-                    if ("Up".equalsIgnoreCase(groupTitle)) {
-                        String condId = mkt.path("conditionId").asText();
-                        double upPrice = mkt.path("outcomePrices").isTextual()
-                                ? parseFirstPrice(mkt.path("outcomePrices").asText())
-                                : 0.5;
-
-                        // token IDs
-                        String tokens = mkt.path("clobTokenIds").asText("[]");
-                        String[] tokenIds = parseTokenIds(tokens);
-
-                        // 2단계: CLOB에서 정밀 오즈 가져오기 (더 정확)
-                        MarketOdds clobOdds = fetchClobOdds(condId, tokenIds, start);
-                        if (clobOdds != null) {
-                            cachedOdds = clobOdds;
-                            cacheTime = System.currentTimeMillis();
-                            return clobOdds;
-                        }
-
-                        // fallback: Gamma 가격 사용
-                        long elapsed = System.currentTimeMillis() - start;
-                        MarketOdds odds = new MarketOdds(upPrice, 1.0 - upPrice,
-                                condId, tokenIds.length > 0 ? tokenIds[0] : "",
-                                tokenIds.length > 1 ? tokenIds[1] : "", elapsed);
-                        cachedOdds = odds;
-                        cacheTime = System.currentTimeMillis();
-                        return odds;
-                    }
+            // 2. CLOB에서 정밀 오즈 (우선)
+            if (upTokenId != null) {
+                MarketOdds clobOdds = fetchClobOdds(condId, upTokenId, downTokenId, start);
+                if (clobOdds != null) {
+                    cachedOdds = clobOdds;
+                    cacheTime = System.currentTimeMillis();
+                    return clobOdds;
                 }
             }
+
+            // 3. Gamma outcomePrices fallback
+            String pricesStr = mkt.path("outcomePrices").asText("");
+            if (!pricesStr.isBlank()) {
+                JsonNode prices = objectMapper.readTree(pricesStr);
+                if (prices.isArray() && prices.size() >= 2) {
+                    double up = prices.get(0).asDouble(0.5);
+                    double down = prices.get(1).asDouble(0.5);
+                    long elapsed = System.currentTimeMillis() - start;
+                    MarketOdds odds = new MarketOdds(up, down, condId,
+                            upTokenId != null ? upTokenId : "",
+                            downTokenId != null ? downTokenId : "", elapsed);
+                    cachedOdds = odds;
+                    cacheTime = System.currentTimeMillis();
+                    log.info("✅ 오즈(Gamma) Up {}¢ Down {}¢ | {} | {}ms",
+                            String.format("%.0f", up * 100), String.format("%.0f", down * 100),
+                            slug, elapsed);
+                    return odds;
+                }
+            }
+
+            return cachedOdds;
+
         } catch (Exception e) {
             log.warn("오즈 조회 실패: {}", e.getMessage());
+            return cachedOdds;
         }
-        return cachedOdds;
     }
 
     /**
-     * CLOB 오더북에서 정밀 mid-price
+     * CLOB 오더북에서 정밀 가격
      */
-    private MarketOdds fetchClobOdds(String condId, String[] tokenIds, long startTime) {
-        if (tokenIds.length < 2) return null;
+    private MarketOdds fetchClobOdds(String condId, String upTokenId, String downTokenId, long startTime) {
         try {
-            String url = CLOB + "/book?token_id=" + tokenIds[0];
-            Request req = new Request.Builder().url(url).build();
-            try (Response resp = httpClient.newCall(req).execute()) {
-                if (!resp.isSuccessful() || resp.body() == null) return null;
-                JsonNode book = objectMapper.readTree(resp.body().string());
-
-                double bestBid = 0, bestAsk = 1;
-                JsonNode bids = book.path("bids");
-                JsonNode asks = book.path("asks");
-
-                if (bids.isArray() && !bids.isEmpty()) {
-                    bestBid = bids.get(0).path("price").asDouble(0);
-                }
-                if (asks.isArray() && !asks.isEmpty()) {
-                    bestAsk = asks.get(0).path("price").asDouble(1);
-                }
-
-                double midPrice = (bestBid + bestAsk) / 2.0;
-                if (midPrice <= 0.01 || midPrice >= 0.99) return null;
-
-                long elapsed = System.currentTimeMillis() - startTime;
-                return new MarketOdds(midPrice, 1.0 - midPrice,
-                        condId, tokenIds[0], tokenIds[1], elapsed);
+            // Up 가격 (CLOB price API)
+            String upUrl = CLOB + "/price?token_id=" + upTokenId + "&side=BUY";
+            String upJson = httpGet(upUrl);
+            double upOdds = 0.5;
+            if (upJson != null) {
+                JsonNode node = objectMapper.readTree(upJson);
+                upOdds = node.path("price").asDouble(0.5);
             }
+
+            // Down 가격
+            double downOdds = 1.0 - upOdds;
+            if (downTokenId != null) {
+                try {
+                    String downUrl = CLOB + "/price?token_id=" + downTokenId + "&side=BUY";
+                    String downJson = httpGet(downUrl);
+                    if (downJson != null) {
+                        JsonNode node = objectMapper.readTree(downJson);
+                        double d = node.path("price").asDouble(-1);
+                        if (d > 0) downOdds = d;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            if (upOdds <= 0.01 || upOdds >= 0.99) return null;
+
+            long elapsed = System.currentTimeMillis() - startTime;
+            log.info("✅ 오즈(CLOB) Up {}¢ Down {}¢ | {}ms",
+                    String.format("%.1f", upOdds * 100), String.format("%.1f", downOdds * 100), elapsed);
+            return new MarketOdds(upOdds, downOdds, condId, upTokenId, downTokenId, elapsed);
+
         } catch (Exception e) {
             return null;
         }
     }
 
     /**
-     * 현재 시간 기반 BTC 5M 마켓 slug 생성
-     * 형식: will-bitcoin-go-up-or-down-in-the-next-5-minutes-Mon-Feb-16-2026-1-45-PM-ET
+     * BTC 5M slug 생성 (poly_bug 검증 방식)
+     * 형식: btc-updown-5m-{epochSecond}
      */
-    private String buildSlug() {
-        ZonedDateTime now = ZonedDateTime.now(ET);
-
-        // 5분 단위 바닥
-        int minute = now.getMinute();
-        int slot = (minute / 5) * 5;
-        ZonedDateTime slotTime = now.withMinute(slot).withSecond(0);
-
-        String dow = slotTime.getDayOfWeek().getDisplayName(TextStyle.SHORT, Locale.ENGLISH);
-        String month = slotTime.getMonth().getDisplayName(TextStyle.SHORT, Locale.ENGLISH);
-        int day = slotTime.getDayOfMonth();
-        int year = slotTime.getYear();
-
-        int hour12 = slotTime.getHour() % 12;
-        if (hour12 == 0) hour12 = 12;
-        String ampm = slotTime.getHour() < 12 ? "AM" : "PM";
-        int min = slotTime.getMinute();
-
-        return String.format("will-bitcoin-go-up-or-down-in-the-next-5-minutes-%s-%s-%d-%d-%d-%02d-%s-ET",
-                dow, month, day, year, hour12, min, ampm);
+    String buildSlug() {
+        ZonedDateTime nowET = ZonedDateTime.now(ET);
+        int minute = nowET.getMinute();
+        int windowStart = (minute / 5) * 5;
+        ZonedDateTime windowStartTime = nowET.withMinute(windowStart).withSecond(0).withNano(0);
+        long epochSecond = windowStartTime.toEpochSecond();
+        return String.format("btc-updown-5m-%d", epochSecond);
     }
 
-    private double parseFirstPrice(String pricesStr) {
+    private String httpGet(String url) {
         try {
-            String cleaned = pricesStr.replaceAll("[\\[\\]\"]", "");
-            String[] parts = cleaned.split(",");
-            return Double.parseDouble(parts[0].trim());
+            Request req = new Request.Builder().url(url)
+                    .header("Accept", "application/json")
+                    .build();
+            try (Response res = httpClient.newCall(req).execute()) {
+                if (!res.isSuccessful() || res.body() == null) return null;
+                return res.body().string();
+            }
         } catch (Exception e) {
-            return 0.5;
-        }
-    }
-
-    private String[] parseTokenIds(String tokensStr) {
-        try {
-            String cleaned = tokensStr.replaceAll("[\\[\\]\"]", "");
-            return cleaned.split(",");
-        } catch (Exception e) {
-            return new String[]{};
+            return null;
         }
     }
 }

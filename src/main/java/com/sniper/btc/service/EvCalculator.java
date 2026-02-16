@@ -5,20 +5,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 /**
- * ⚡ EV 계산기 — 순수 수학, AI 없음
+ * ⚡ EV 계산기 — poly_bug ExpectedValueCalculator 정합 버전
  *
- * poly_bug의 ExpectedValueCalculator에서 핵심만 추출
- * 5M BTC 승률 76% 기반 Kelly 동적 배팅
- *
- * 순방향: 가격 방향과 같은쪽 배팅 (모멘텀)
- * 역방향: 오즈가 과잉반응했을 때 반대쪽 배팅 (평균회귀)
+ * poly_bug 검증 로직:
+ * 1. 확률 추정: 변동폭 구간별 baseProb + 속도·모멘텀·시간 보너스
+ * 2. 순방향 EV: (추정확률 / 시장오즈) - 1, 오즈 20-80% 클램프
+ * 3. Kelly 배팅: EV 비례 동적 사이즈 (2-12%)
+ * 4. 역방향: 비활성화 (구조적 EV 뻥튀기)
  */
 @Slf4j
 @Service
 public class EvCalculator {
-
-    @Value("${sniper.min-ev:0.10}")
-    private double minEv;
 
     @Value("${sniper.min-bet:1.0}")
     private double minBet;
@@ -26,15 +23,11 @@ public class EvCalculator {
     @Value("${sniper.max-bet:10.0}")
     private double maxBet;
 
-    // 순방향 오즈 범위
+    // poly_bug 동일: 순방향 오즈 범위
     private static final double FWD_MIN_ODDS = 0.20;
     private static final double FWD_MAX_ODDS = 0.80;
-
-    // 역방향 오즈 범위
-    private static final double REV_MIN_ODDS = 0.05;
-    private static final double REV_MAX_ODDS = 0.95;
-
     private static final double MAX_EV = 0.80;
+    private static final double FWD_THRESHOLD = 0.08; // poly_bug: 8%
 
     public record EvResult(
             String direction,    // UP / DOWN / HOLD
@@ -42,111 +35,118 @@ public class EvCalculator {
             double estimatedProb,
             double gap,
             double betAmount,
-            String strategy,     // FWD / REV
+            String strategy,     // FWD
             String reason
     ) {}
 
     /**
-     * 순방향 EV 계산 (가격 모멘텀 추종)
+     * 순방향 EV 계산 — poly_bug estimateProbFromPriceMove + calculateMomentum 통합
      *
-     * @param priceDiffPct  시초가 대비 변동률 (양수=상승, 음수=하락)
+     * @param priceDiffPct  시초가 대비 변동률
      * @param upOdds        Up 오즈
-     * @param winRate       최근 승률
+     * @param velocity      가격 변동 속도 (%/초)
+     * @param momentumScore 모멘텀 일관성 (-1~+1)
+     * @param timeBonus     캔들 진행도 보너스
      * @param balance       현재 잔액
      */
-    public EvResult calcForward(double priceDiffPct, double upOdds, double winRate, double balance) {
-        // 가격 방향 결정
+    public EvResult calcForward(double priceDiffPct, double upOdds,
+                                 double velocity, double momentumScore,
+                                 double timeBonus, double balance) {
         boolean isUp = priceDiffPct > 0;
         double absDiff = Math.abs(priceDiffPct);
 
-        // 변동폭 기반 추정 확률 (5M BTC 76% 승률 + 변동폭 보정)
-        double baseProb = 0.55 + Math.min(absDiff * 2.5, 0.30); // 변동폭 클수록 확률 상승
-        baseProb = clamp(baseProb, 0.50, 0.85);
+        // ⭐ poly_bug 동일: 확률 추정 (구간별 baseProb)
+        // 🔧 FIX: signed priceDiffPct 전달 (velocity 방향 불일치 페널티용)
+        double baseProb = estimateProb(priceDiffPct, velocity, momentumScore, timeBonus);
 
         // 오즈 클램프
         double clampedUp = clamp(upOdds, FWD_MIN_ODDS, FWD_MAX_ODDS);
-        double clampedDown = 1.0 - clampedUp;
+        double targetOdds = isUp ? clampedUp : (1.0 - clampedUp);
 
         // EV 계산
-        double targetOdds = isUp ? clampedUp : clampedDown;
         double ev = Math.min((baseProb / targetOdds) - 1.0, MAX_EV);
         double gap = baseProb - targetOdds;
 
-        if (ev < minEv || gap < 0.03) {
-            return new EvResult("HOLD", ev, baseProb, gap, 0,
-                    "FWD", String.format("FWD EV부족 %.1f%% (임계%.1f%%)", ev * 100, minEv * 100));
+        if (ev <= FWD_THRESHOLD) {
+            return new EvResult("HOLD", ev, baseProb, gap, 0, "FWD",
+                    String.format("FWD EV%.1f%% ≤ 임계%.0f%%", ev * 100, FWD_THRESHOLD * 100));
         }
 
-        double bet = calcKellyBet(ev, balance, winRate);
+        double bet = calcBetSize(balance, ev, targetOdds);
         String dir = isUp ? "UP" : "DOWN";
 
         return new EvResult(dir, ev, baseProb, gap, bet, "FWD",
-                String.format("FWD %s | 가격%+.3f%% | 추정%.0f%% vs 오즈%.0f%% | EV%+.1f%%",
+                String.format("FWD %s | 가격%+.3f%% | 추정%.0f%% vs 오즈%.0f%% | EV+%.1f%%",
                         dir, priceDiffPct, baseProb * 100, targetOdds * 100, ev * 100));
     }
 
     /**
-     * 역방향 EV 계산 (오즈 과잉반응 역이용)
-     *
-     * @param priceDiffPct  시초가 대비 변동률
-     * @param upOdds        Up 오즈
-     * @param winRate       최근 승률
-     * @param balance       현재 잔액
+     * ⭐ poly_bug estimateProbFromPriceMove 동일 구현 (5M 전용)
+     * @param changePct signed 가격 변동률 (양수=UP, 음수=DOWN)
      */
-    public EvResult calcReverse(double priceDiffPct, double upOdds, double winRate, double balance) {
-        boolean priceUp = priceDiffPct > 0;
+    private double estimateProb(double changePct, double velocity, double momentumScore, double timeBonus) {
+        double absPct = Math.abs(changePct);
 
-        // 역방향 = 가격 반대쪽의 오즈가 너무 싸면 매수
-        double reverseOdds = priceUp ? (1.0 - upOdds) : upOdds;
-        double clampedReverse = clamp(reverseOdds, REV_MIN_ODDS, REV_MAX_ODDS);
+        // 5M 타임프레임 보너스
+        double tfBonus = 0.05;
 
-        // 역방향 추정 확률: 변동폭 작으면 확률 높음 (평균회귀)
-        double absDiff = Math.abs(priceDiffPct);
-        double reverseProbBase = 0.45 - Math.min(absDiff * 1.5, 0.15);
-        reverseProbBase = clamp(reverseProbBase, 0.25, 0.50);
+        // 속도 보너스
+        double velocityBonus = 0.0;
+        double absVelocity = Math.abs(velocity);
+        if (absVelocity >= 0.05)      velocityBonus = 0.06;
+        else if (absVelocity >= 0.02) velocityBonus = 0.04;
+        else if (absVelocity >= 0.01) velocityBonus = 0.02;
 
-        // 오즈가 매우 싸면 (< 0.15) 추가 보정
-        if (clampedReverse < 0.15) {
-            reverseProbBase += 0.10;
+        // 🔧 FIX: poly_bug 동일 — 속도 역방향이면 -0.02로 덮어쓰기
+        // 가격은 올라가는데 속도는 하락 중 (또는 그 반대) = 반전 징후
+        if ((changePct > 0 && velocity < 0) || (changePct < 0 && velocity > 0)) {
+            velocityBonus = -0.02;
         }
 
-        double ev = Math.min((reverseProbBase / clampedReverse) - 1.0, MAX_EV);
-        double gap = reverseProbBase - clampedReverse;
+        // 모멘텀 일관성 보너스
+        double momentumBonus = 0.0;
+        double absMomentum = Math.abs(momentumScore);
+        if (absMomentum >= 0.8) momentumBonus = 0.04;
+        else if (absMomentum >= 0.6) momentumBonus = 0.02;
+        else if (absMomentum < 0.3) momentumBonus = -0.02;
 
-        if (ev < minEv || gap < 0.06) {
-            return new EvResult("HOLD", ev, reverseProbBase, gap, 0,
-                    "REV", String.format("REV EV부족 %.1f%%", ev * 100));
-        }
+        double bonus = tfBonus + timeBonus + velocityBonus + momentumBonus;
 
-        double bet = calcKellyBet(ev, balance, winRate) * 0.7; // 역방향은 70% 사이즈
-        bet = clamp(bet, minBet, maxBet);
-        String dir = priceUp ? "DOWN" : "UP"; // 가격 반대
+        // ⭐ poly_bug 동일: 구간별 기본 확률
+        double baseProb;
+        if (absPct >= 1.0)       baseProb = 0.85;
+        else if (absPct >= 0.7)  baseProb = 0.80;
+        else if (absPct >= 0.5)  baseProb = 0.73;
+        else if (absPct >= 0.35) baseProb = 0.66;
+        else if (absPct >= 0.25) baseProb = 0.61;
+        else if (absPct >= 0.15) baseProb = 0.57;
+        else if (absPct >= 0.10) baseProb = 0.54;
+        else if (absPct >= 0.08) baseProb = 0.52;
+        else                     baseProb = 0.51;
 
-        return new EvResult(dir, ev, reverseProbBase, gap, bet, "REV",
-                String.format("REV %s | 가격%+.3f%% | 추정%.0f%% vs 오즈%.0f%% | EV%+.1f%%",
-                        dir, priceDiffPct, reverseProbBase * 100, clampedReverse * 100, ev * 100));
+        return clamp(baseProb + bonus, 0.50, 0.92);
     }
 
     /**
-     * Kelly Criterion 동적 배팅 사이즈
-     * EV 크기에 비례, 잔액의 2~12%
+     * ⭐ poly_bug calcBetSize 동일: Kelly Criterion (EV 비례)
      */
-    private double calcKellyBet(double ev, double balance, double winRate) {
-        double kellyFraction;
-        if (ev >= 0.50) {
-            kellyFraction = 0.08 + (ev - 0.50) * 0.13; // 8-12%
-        } else if (ev >= 0.30) {
-            kellyFraction = 0.04 + (ev - 0.30) * 0.20; // 4-8%
-        } else {
-            kellyFraction = 0.02 + (ev - minEv) * 0.10;  // 2-4%
-        }
+    double calcBetSize(double balance, double ev, double marketOdds) {
+        if (ev <= 0) return 0;
+        marketOdds = clamp(marketOdds, FWD_MIN_ODDS, FWD_MAX_ODDS);
 
-        // 승률 보정
-        if (winRate > 0.70) kellyFraction *= 1.15;
-        if (winRate < 0.50) kellyFraction *= 0.70;
+        double payout = 1.0 / marketOdds;
+        double kellyFraction = ev / (payout - 1.0);
 
-        kellyFraction = clamp(kellyFraction, 0.02, 0.12);
-        double bet = balance * kellyFraction;
+        double kellyMultiplier;
+        if (ev >= 1.0)      kellyMultiplier = 0.35;
+        else if (ev >= 0.5) kellyMultiplier = 0.30;
+        else if (ev >= 0.3) kellyMultiplier = 0.25;
+        else                kellyMultiplier = 0.20;
+
+        double safeFraction = kellyFraction * kellyMultiplier;
+        safeFraction = clamp(safeFraction, 0.02, 0.12);
+
+        double bet = balance * safeFraction;
         return clamp(bet, minBet, maxBet);
     }
 

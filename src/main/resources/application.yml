@@ -27,16 +27,11 @@ sniper:
   # 스캔 속도 (ms)
   scan-interval-ms: 500
 
-  # EV 임계값
-  min-ev: 0.10
-  min-gap: 0.06
-
   # 배팅 한도
   min-bet: 1.0
   max-bet: 10.0
 
-  # 쿨다운 (ms)
-  cooldown-ms: 60000
+  # ※ 쿨다운 90초, 최소변동 0.03%, EV임계 8%, 갭임계 6% → poly_bug 동일 하드코딩
 
   # 오즈 캐시 TTL (ms)
   odds-cache-ttl-ms: 500

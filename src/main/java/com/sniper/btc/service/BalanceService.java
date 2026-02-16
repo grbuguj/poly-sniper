@@ -49,6 +49,10 @@ public class BalanceService {
         return balance.get();
     }
 
+    public double getInitialBalance() {
+        return initialBalance;
+    }
+
     public void deductBet(double amount) {
         balance.updateAndGet(b -> b - amount);
     }

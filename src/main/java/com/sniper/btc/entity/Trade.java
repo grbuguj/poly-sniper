@@ -33,7 +33,7 @@ public class Trade {
     private double betAmount;
     private double odds;           // 진입 오즈
     private double entryPrice;     // Chainlink 진입가
-    private double openPrice;      // 5M 캔들 시초가
+    private Double openPrice;      // 5M 캔들 시초가 (nullable — 0이면 판정 불가)
     private double exitPrice;      // 판정 종가
 
     private double estimatedProb;  // 추정 확률

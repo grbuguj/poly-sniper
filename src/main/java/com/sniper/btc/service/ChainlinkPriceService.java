@@ -49,6 +49,9 @@ public class ChainlinkPriceService {
     private final ScheduledExecutorService reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
     private volatile boolean connected = false;
 
+    // ⭐ 워밍업: 첫 5M 경계 전환 전까지 시초가 부정확 → 배팅 금지
+    private volatile boolean warmedUp = false;
+
     @PostConstruct
     public void connect() {
         connectWebSocket();
@@ -172,7 +175,15 @@ public class ChainlinkPriceService {
             last5mBoundary = boundary;
             current5mOpen = findClosestPrice(boundary);
             if (current5mOpen <= 0) current5mOpen = price;
-            log.info("📌 새 5M 캔들 시초가: ${} (boundary={})", String.format("%.2f", current5mOpen), boundary);
+
+            // ⭐ 첫 경계 전환 = 워밍업 완료 (이 시초가부터 정확)
+            if (!warmedUp) {
+                warmedUp = true;
+                log.info("✅ 워밍업 완료! 첫 정확한 5M 시초가: ${} (boundary={})", 
+                        String.format("%.2f", current5mOpen), boundary);
+            } else {
+                log.info("📌 새 5M 캔들 시초가: ${} (boundary={})", String.format("%.2f", current5mOpen), boundary);
+            }
 
             // 오래된 종가 정리
             long cutoff = boundary - 3600;
@@ -218,4 +229,6 @@ public class ChainlinkPriceService {
     public Double getCloseAt(long boundaryTsSec) { return closeSnapshots.get(boundaryTsSec); }
 
     public boolean isConnected() { return connected && getPriceAgeMs() < 10_000; }
+
+    public boolean isWarmedUp() { return warmedUp; }
 }
