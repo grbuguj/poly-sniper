@@ -15,3 +15,7 @@ build/
 
 # OS
 .DS_Store
+
+# Secrets
+.env.sh
+derive_api_key.py
