@@ -247,7 +247,7 @@ public class SniperScanner {
             // ⭐ poly_bug 동일: 캔들 포지션 필터 (position 1-3만)
             int candlePos = getCandlePosition();
             if (candlePos < 1) {
-                addLogThrottled("📊", "캔들", "시작 40초 대기");
+                addLogThrottled("📊", "캔들", candlePos == 0 ? "시작 40초 대기" : "마감 40초 차단");
                 return;
             }
 
@@ -337,7 +337,8 @@ public class SniperScanner {
         int elapsed = (minute % 5) * 60 + second;
         int total = 300;
 
-        if (elapsed < 40) return 0;   // 시작 40초 대기 (방향 미확정)
+        if (elapsed < 40) return 0;    // 시작 40초 대기 (방향 미확정)
+        if (elapsed >= 285) return -1; // 마감 15초 차단 (마켓 정산/교체 구간)
         double pct = (double) elapsed / total;
         if (pct < 0.30) return 1;
         if (pct < 0.70) return 2;

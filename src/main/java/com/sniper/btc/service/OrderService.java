@@ -101,8 +101,9 @@ public class OrderService {
      */
     public OrderResult placeOrder(String tokenId, double amount, double price, String side) {
         // 실제 토큰 수량 & USDC 계산 (대시보드 표시용)
-        double actualSize = Math.max(MIN_SIZE, Math.floor((amount / price) * 100.0) / 100.0);
-        double actualAmount = actualSize * price;
+        double tickPrice = Math.round(price * 100.0) / 100.0; // tick size 0.01
+        double actualSize = Math.max(MIN_SIZE, Math.floor((amount / tickPrice) * 100.0) / 100.0);
+        double actualAmount = actualSize * tickPrice;
 
         if (dryRun) {
             log.info("🧪 [DRY-RUN] 주문 시뮬: {} ${} ({}토큰) @ {} ({})", side, fmt(actualAmount), fmt(actualSize), fmt(price), tokenId.substring(0, 8));
@@ -127,10 +128,12 @@ public class OrderService {
         int sigType = (funder != null && !funder.isEmpty()) ? 1 : 0;
 
         // ── 금액 계산 (Python SDK 방식) ──
+        // 🔧 FIX: 가격을 tick size(0.01)로 반올림 — CLOB이 0.485 같은 mid-price 반환할 수 있음
+        double tickPrice = Math.round(price * 100.0) / 100.0;
         // size = 토큰 수량, 최소 5개
-        double size = Math.max(MIN_SIZE, Math.floor((amount / price) * 100.0) / 100.0);
-        // BUY: makerAmount = USDC (size * price), takerAmount = 토큰 수
-        long makerAmountRaw = (long) (size * price * 1e6);
+        double size = Math.max(MIN_SIZE, Math.floor((amount / tickPrice) * 100.0) / 100.0);
+        // BUY: makerAmount = USDC (size * tickPrice), takerAmount = 토큰 수
+        long makerAmountRaw = (long) (size * tickPrice * 1e6);
         long takerAmountRaw = (long) (size * 1e6);
 
         BigInteger salt = BigInteger.valueOf(System.currentTimeMillis());
@@ -179,7 +182,7 @@ public class OrderService {
 
         String orderJson = objectMapper.writeValueAsString(payload);
 
-        log.info("📤 주문 전송: {} {} 토큰 @ {} (${}) sigType={}", side, size, fmt(price), fmt(size * price), sigType);
+        log.info("📤 주문 전송: {} {} 토큰 @ {} (${}) sigType={} [raw price {} → tick {}]", side, size, fmt(tickPrice), fmt(size * tickPrice), sigType, fmt(price), fmt(tickPrice));
         log.info("📋 ORDER JSON: {}", orderJson);
 
         // ── HMAC L2 서명 & 전송 ──
@@ -197,7 +200,7 @@ public class OrderService {
                 JsonNode result = objectMapper.readTree(body);
                 String orderId = result.path("orderID").asText("unknown");
                 String status = result.path("status").asText("");
-                double actualUsd = size * price;
+                double actualUsd = size * tickPrice;
                 log.info("✅ LIVE 주문 성공: {} status={} ({}) ${} ({}tok)", orderId, status, side, fmt(actualUsd), fmt(size));
                 return new OrderResult(true, orderId, null, actualUsd, size);
             } else {
