@@ -31,7 +31,7 @@ import java.util.concurrent.TimeUnit;
  * 5. 스프레드 검증 (up+down > 1.05 → 스킵)
  * 6. 시간당 한도 (5M: 시간당 5건)
  * 7. 서킷브레이커 (3연패 → 5분 정지)
- * 8. 역방향 비활성화
+ * 8. 역방향 비활성화 (5M은 너무 짧아서 반전 불발)
  * 9. 쿨다운 90초
  * 10. 최소 변동폭 0.03% (BTC 5M = 0.06 * 0.5)
  */
@@ -62,22 +62,21 @@ public class SniperScanner {
     private final ScheduledExecutorService scanExecutor = Executors.newSingleThreadScheduledExecutor();
 
     // === poly_bug 동일 상수 ===
-    private static final long COOLDOWN_MS = 90_000;        // 5M: 90초
+    // 쿨다운: 캔들당 1건 (같은 마켓 중복 방지, 새 캔들은 즉시 진입)
     private static final double MIN_PRICE_MOVE = 0.03;     // BTC 5M = 0.06 * 0.5
     private static final double MAX_SPREAD = 1.05;
     private static final double BASE_FORWARD_GAP = 0.06;
-    private static final int MAX_TRADES_PER_HOUR = 5;      // 5M: 시간당 5건
+
+    // 시간당 한도 제거 — 쿨다운 30초 + 서킷브레이커로 충분
     private static final int MOMENTUM_WINDOW = 10;
     private static final long CIRCUIT_BREAKER_DURATION = 300_000; // 5분
     private static final double MIN_BALANCE = 1.0;
     private static final ZoneId ET = ZoneId.of("America/New_York");
 
-    // 쿨다운
-    private volatile long lastTradeTime = 0;
+    // 캔들당 1건 제한
+    private volatile int lastTradedCandleWindow = -1;
 
-    // 시간당 한도
-    private volatile int hourlyTradeCount = 0;
-    private volatile int lastHour = -1;
+
 
     // 성과 통계
     private volatile int totalScans = 0;
@@ -128,9 +127,7 @@ public class SniperScanner {
         totalScanTimeMs = 0;
         recentWinRate = 0.50;
         winRateLastCalc = 0;
-        lastTradeTime = 0;
-        hourlyTradeCount = 0;
-        lastHour = -1;
+        lastTradedCandleWindow = -1;
         crossCount = 0;
         lastCrossDir = 0;
         lastResetWindow = -1;
@@ -148,8 +145,8 @@ public class SniperScanner {
     public void start() {
         log.info("🚀 BTC 5M Sniper 시작 — {}ms 간격, {} 모드 | poly_bug 정합 V2",
                 scanIntervalMs, dryRun ? "DRY-RUN" : "🔴 LIVE");
-        log.info("   최소변동 {}% | 쿨다운 {}초 | 시간당 {}건 | 서킷브레이커 3연패→5분정지",
-                MIN_PRICE_MOVE, COOLDOWN_MS / 1000, MAX_TRADES_PER_HOUR);
+        log.info("   최소변동 {}% | 캔들당 1건 | 서킷브레이커 3연패→5분정지",
+                MIN_PRICE_MOVE);
         scanExecutor.scheduleAtFixedRate(this::scan, 3000, scanIntervalMs, TimeUnit.MILLISECONDS);
     }
 
@@ -197,10 +194,10 @@ public class SniperScanner {
                 return;
             }
 
-            // 2. 쿨다운 체크
-            if (isOnCooldown()) {
-                long remain = COOLDOWN_MS - (System.currentTimeMillis() - lastTradeTime);
-                addLogThrottled("⏱️", "쿨다운", String.format("대기 %.0f초 남음", remain / 1000.0));
+            // 2. 캔들당 1건 체크
+            int currentCandleWindow = getCurrentCandleWindow();
+            if (currentCandleWindow == lastTradedCandleWindow) {
+                addLogThrottled("⏱️", "쿨다운", "이미 이 캔들에서 배팅 완료");
                 return;
             }
 
@@ -243,10 +240,8 @@ public class SniperScanner {
 
             // ⭐ poly_bug 동일: 캔들 포지션 필터 (position 1-3만)
             int candlePos = getCandlePosition();
-            if (candlePos < 1 || candlePos > 3) {
-                addLogThrottled("📊", "캔들",
-                        String.format("position %d → %s", candlePos,
-                                candlePos == 0 ? "시작 40초 대기" : "마감 40초 제외"));
+            if (candlePos < 1) {
+                addLogThrottled("📊", "캔들", "시작 40초 대기");
                 return;
             }
 
@@ -262,12 +257,6 @@ public class SniperScanner {
             if (spread > MAX_SPREAD) {
                 addLogThrottled("📊", "스프레드",
                         String.format("%.1f%% > %.0f%% → 스킵", spread * 100, MAX_SPREAD * 100));
-                return;
-            }
-
-            // ⭐ poly_bug 동일: 시간당 한도
-            if (!checkHourlyLimit()) {
-                addLogThrottled("📊", "한도", "시간당 " + MAX_TRADES_PER_HOUR + "건 초과");
                 return;
             }
 
@@ -312,7 +301,7 @@ public class SniperScanner {
                 return;
             }
 
-            // 8. 🎯 배팅 실행!
+            // 8. 🎯 순방향 배팅 실행!
             long elapsed = (System.nanoTime() - scanStart) / 1_000_000;
             addLog("🎯", "배팅",
                     String.format("[FWD] %s $%.2f @ %.0f¢ | EV+%.1f%% | 갭%.1f%% | 모멘텀%.0f%%",
@@ -332,7 +321,8 @@ public class SniperScanner {
 
     // =========================================================================
     // ⭐ poly_bug 동일: 캔들 포지션 (5M 전용)
-    // 0=시작40초, 1=초반, 2=중반, 3=후반, 4=마감40초
+    // 0=시작40초, 1=초반, 2=중반, 3=후반
+    // 마감 제외 없음 — 후반이 방향 확신 가장 높은 구간
     // =========================================================================
     private int getCandlePosition() {
         ZonedDateTime nowET = ZonedDateTime.now(ET);
@@ -340,10 +330,8 @@ public class SniperScanner {
         int second = nowET.getSecond();
         int elapsed = (minute % 5) * 60 + second;
         int total = 300;
-        int remaining = total - elapsed;
 
-        if (elapsed < 40) return 0;   // 시작 40초 제외
-        if (remaining < 40) return 4; // 마감 40초 제외
+        if (elapsed < 40) return 0;   // 시작 40초 대기 (방향 미확정)
         double pct = (double) elapsed / total;
         if (pct < 0.30) return 1;
         if (pct < 0.70) return 2;
@@ -466,17 +454,7 @@ public class SniperScanner {
         }
     }
 
-    // =========================================================================
-    // ⭐ poly_bug 동일: 시간당 한도
-    // =========================================================================
-    private boolean checkHourlyLimit() {
-        int currentHour = (int) (System.currentTimeMillis() / 3_600_000);
-        if (currentHour != lastHour) {
-            lastHour = currentHour;
-            hourlyTradeCount = 0;
-        }
-        return hourlyTradeCount < MAX_TRADES_PER_HOUR;
-    }
+
 
     // =========================================================================
     // ⭐ poly_bug 동일: 승률 기반 동적 임계값
@@ -493,9 +471,8 @@ public class SniperScanner {
     // =========================================================================
     private void executeTrade(EvCalculator.EvResult ev, OddsService.MarketOdds odds,
                                double currentPrice, double openPrice, double priceDiffPct, long scanMs) {
-        lastTradeTime = System.currentTimeMillis();
+        lastTradedCandleWindow = getCurrentCandleWindow();
         totalTrades++;
-        hourlyTradeCount++;
 
         boolean isBuyYes = "UP".equals(ev.direction());
         Trade.TradeAction action = isBuyYes ? Trade.TradeAction.BUY_YES : Trade.TradeAction.BUY_NO;
@@ -534,7 +511,8 @@ public class SniperScanner {
             log.error("DB 저장 실패: {}", e.getMessage());
         }
 
-        log.info("🎯 [FWD] {} ${} @ {}¢ | EV+{}% | 가격${} (시초${}) {}% | 모멘텀{}% | {}ms",
+        log.info("🎯 [{}] {} ${} @ {}¢ | EV+{}% | 가격${} (시초${}) {}% | 모멘텀{}% | {}ms",
+                ev.strategy(),
                 action, String.format("%.2f", ev.betAmount()),
                 String.format("%.0f", mktOdds * 100), String.format("%.1f", ev.ev() * 100),
                 String.format("%.2f", currentPrice), String.format("%.2f", openPrice),
@@ -542,8 +520,13 @@ public class SniperScanner {
                 String.format("%.0f", Math.abs(getMomentumConsistency()) * 100), scanMs);
     }
 
-    private boolean isOnCooldown() {
-        return (System.currentTimeMillis() - lastTradeTime) < COOLDOWN_MS;
+    /**
+     * 현재 5분봄 윈도우 ID (ET 기준)
+     * 예: 18:05~18:09 = 같은 윈도우
+     */
+    private int getCurrentCandleWindow() {
+        ZonedDateTime nowET = ZonedDateTime.now(ET);
+        return nowET.getHour() * 12 + nowET.getMinute() / 5;
     }
 
     private void refreshWinRate() {
@@ -564,7 +547,7 @@ public class SniperScanner {
         double avgScanMs = totalScans > 0 ? (double) totalScanTimeMs / totalScans : 0;
         return new SniperStats(totalScans, totalTrades, wins, losses, recentWinRate,
                 balanceService.getBalance(), avgScanMs, chainlink.isConnected(),
-                dryRun, lastTradeTime);
+                dryRun, lastTradedCandleWindow);
     }
 
     public void recordWin() { wins++; }
@@ -600,6 +583,6 @@ public class SniperScanner {
     public record SniperStats(
             int totalScans, int totalTrades, int wins, int losses,
             double winRate, double balance, double avgScanMs,
-            boolean chainlinkConnected, boolean dryRun, long lastTradeTime
+            boolean chainlinkConnected, boolean dryRun, int lastTradedCandle
     ) {}
 }

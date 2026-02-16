@@ -11,7 +11,7 @@ import org.springframework.stereotype.Service;
  * 1. 확률 추정: 변동폭 구간별 baseProb + 속도·모멘텀·시간 보너스
  * 2. 순방향 EV: (추정확률 / 시장오즈) - 1, 오즈 20-80% 클램프
  * 3. Kelly 배팅: EV 비례 동적 사이즈 (2-12%)
- * 4. 역방향: 비활성화 (구조적 EV 뻥튀기)
+ * 4. 역방향: 시장 과잉반응 시 반대 배팅 (오즈 5-95% 클램프, Kelly 15-25%)
  */
 @Slf4j
 @Service
@@ -28,6 +28,11 @@ public class EvCalculator {
     private static final double FWD_MAX_ODDS = 0.80;
     private static final double MAX_EV = 0.80;
     private static final double FWD_THRESHOLD = 0.08; // poly_bug: 8%
+
+    // ⭐ poly_bug 동일: 역방향 오즈 범위 (싼 오즈가 핵심)
+    private static final double REV_MIN_ODDS = 0.05;
+    private static final double REV_MAX_ODDS = 0.95;
+    private static final double REV_THRESHOLD = 0.15; // 역방향은 15% (더 보수적)
 
     public record EvResult(
             String direction,    // UP / DOWN / HOLD
@@ -148,6 +153,78 @@ public class EvCalculator {
 
         double bet = balance * safeFraction;
         return clamp(bet, minBet, maxBet);
+    }
+
+    /**
+     * ⭐ 역방향 EV 계산 — 시장 과잉반응, 반대쪽 저평가
+     *
+     * 핵심: 가격이 크게 올랐는데 시장이 DOWN 오즈를 너무 낮게 책정 → DOWN 배팅
+     * 예: BTC +0.5% → 시장 DOWN 12¢ → 추정 반전확률 27% → EV = (27/12)-1 = +125%
+     *
+     * @param priceDiffPct     시초가 대비 변동률 (순방향 기준)
+     * @param fwdMarketOdds    순방향 오즈 (이게 높으면 = 역방향이 싸다)
+     * @param reverseMarketOdds 역방향 오즈 (실제 배팅할 쪽)
+     * @param fwdEstimatedProb 순방향 추정 확률
+     * @param balance          현재 잔액
+     */
+    public EvResult calcReverse(double priceDiffPct, double fwdMarketOdds,
+                                 double reverseMarketOdds, double fwdEstimatedProb,
+                                 double balance) {
+        // 역방향 추정 확률 = 1 - 순방향 확률
+        double reverseEstProb = 1.0 - fwdEstimatedProb;
+        // poly_bug 동일: 역방향 확률 15-60% 클램프 (뻥튀기 방지)
+        reverseEstProb = clamp(reverseEstProb, 0.15, 0.60);
+
+        // 역방향 오즈 클램프 (5-95% — 싼 오즈의 진짜 가치 계산)
+        double clampedRevOdds = clamp(reverseMarketOdds, REV_MIN_ODDS, REV_MAX_ODDS);
+
+        double ev = Math.min((reverseEstProb / clampedRevOdds) - 1.0, MAX_EV);
+        double gap = reverseEstProb - clampedRevOdds;
+
+        // 역방향은 가격 반대
+        boolean priceIsUp = priceDiffPct > 0;
+        String revDir = priceIsUp ? "DOWN" : "UP";
+
+        if (ev <= REV_THRESHOLD) {
+            return new EvResult("HOLD", ev, reverseEstProb, gap, 0, "REV",
+                    String.format("REV EV%.1f%% ≤ 임계%.0f%%", ev * 100, REV_THRESHOLD * 100));
+        }
+
+        double bet = calcReverseBetSize(balance, ev, clampedRevOdds);
+
+        return new EvResult(revDir, ev, reverseEstProb, gap, bet, "REV",
+                String.format("REV %s | 가격%+.3f%% | 추정%.0f%% vs 오즈%.0f¢ | EV+%.1f%%",
+                        revDir, priceDiffPct, reverseEstProb * 100, reverseMarketOdds * 100, ev * 100));
+    }
+
+    /**
+     * ⭐ poly_bug 동일: 역방향 전용 배팅 사이즈 (더 보수적)
+     * Kelly 15-25%, 잔액 2-8%
+     */
+    private double calcReverseBetSize(double balance, double ev, double marketOdds) {
+        if (ev <= 0) return 0;
+        marketOdds = clamp(marketOdds, REV_MIN_ODDS, REV_MAX_ODDS);
+
+        double payout = 1.0 / marketOdds;
+        double kellyFraction = ev / (payout - 1.0);
+
+        double kellyMultiplier;
+        if (ev >= 1.5)      kellyMultiplier = 0.25;
+        else if (ev >= 0.8) kellyMultiplier = 0.20;
+        else                kellyMultiplier = 0.15;
+
+        double safeFraction = kellyFraction * kellyMultiplier;
+        safeFraction = clamp(safeFraction, 0.02, 0.08); // 2-8% (순방향보다 보수적)
+
+        double bet = balance * safeFraction;
+        return clamp(bet, minBet, maxBet);
+    }
+
+    /**
+     * 순방향 확률 추정값을 외부에서 접근 (역방향 계산용)
+     */
+    public double estimateProbPublic(double changePct, double velocity, double momentumScore, double timeBonus) {
+        return estimateProb(changePct, velocity, momentumScore, timeBonus);
     }
 
     private double clamp(double val, double min, double max) {
