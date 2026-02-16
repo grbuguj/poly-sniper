@@ -4,6 +4,8 @@ import com.sniper.btc.entity.Trade;
 import com.sniper.btc.repository.TradeRepository;
 import com.sniper.btc.service.BalanceService;
 import com.sniper.btc.service.ChainlinkPriceService;
+import com.sniper.btc.service.OddsService;
+import com.sniper.btc.service.OrderService;
 import com.sniper.btc.service.SniperScanner;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Controller;
@@ -23,6 +25,8 @@ public class DashboardController {
     private final BalanceService balanceService;
     private final ChainlinkPriceService chainlink;
     private final SniperScanner sniperScanner;
+    private final OddsService oddsService;
+    private final OrderService orderService;
 
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final DateTimeFormatter DATETIME_FMT = DateTimeFormatter.ofPattern("MM/dd HH:mm");
@@ -127,6 +131,7 @@ public class DashboardController {
         result.put("avgScanMs", stats.avgScanMs());
         result.put("dryRun", stats.dryRun());
         result.put("warmedUp", chainlink.isWarmedUp());
+        result.put("enabled", stats.enabled());
         // 이퀄리티 커브
         result.put("peakBalance", peakBalance);
         result.put("troughBalance", troughBalance);
@@ -138,6 +143,63 @@ public class DashboardController {
         return result;
     }
 
+    @GetMapping("/api/test/balance")
+    @ResponseBody
+    public Map<String, Object> testBalance() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        try {
+            double liveBalance = orderService.fetchLiveBalance();
+            result.put("success", liveBalance >= 0);
+            result.put("balance", liveBalance);
+            result.put("isLive", orderService.isLive());
+        } catch (Exception e) {
+            result.put("success", false);
+            result.put("error", e.getMessage());
+        }
+        return result;
+    }
+
+    @PostMapping("/api/test/order")
+    @ResponseBody
+    public Map<String, Object> testOrder() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        try {
+            // 현재 활성 마켓의 오즈 조회
+            var odds = oddsService.getOdds();
+            if (odds == null) {
+                result.put("success", false);
+                result.put("error", "No active market / odds not available");
+                return result;
+            }
+            // $1 최소 배팅 테스트 (Up 토큰)
+            OrderService.OrderResult order = orderService.placeOrder(
+                    odds.upTokenId(), 1.0, odds.upOdds(), "BUY");
+            result.put("success", order.success());
+            result.put("orderId", order.orderId());
+            result.put("error", order.error());
+            result.put("tokenId", odds.upTokenId().substring(0, 12) + "...");
+            result.put("odds", odds.upOdds());
+            result.put("requestedAmount", 1.0);
+            result.put("actualAmount", order.actualAmount());
+            result.put("actualSize", order.actualSize());
+        } catch (Exception e) {
+            result.put("success", false);
+            result.put("error", e.getMessage());
+        }
+        return result;
+    }
+
+    @PostMapping("/api/toggle")
+    @ResponseBody
+    public Map<String, Object> toggleSniper() {
+        boolean newState = !sniperScanner.isEnabled();
+        sniperScanner.setEnabled(newState);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("enabled", newState);
+        result.put("mode", sniperScanner.getStats().dryRun() ? "DRY-RUN" : "LIVE");
+        return result;
+    }
+
     @PostMapping("/api/reset")
     @ResponseBody
     @Transactional
@@ -145,7 +207,7 @@ public class DashboardController {
         long count = tradeRepository.count();
         tradeRepository.deleteAll();
         sniperScanner.resetStats();
-        balanceService.recalcFromDb();
+        balanceService.resetInitialBalance();
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("success", true);

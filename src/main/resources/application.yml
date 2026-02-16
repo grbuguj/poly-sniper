@@ -21,8 +21,8 @@ spring:
 # === 트레이딩 설정 ===
 sniper:
   # DRY-RUN / LIVE 스위칭
-  dry-run: true
-  initial-balance: 50.0
+  dry-run: false
+  initial-balance: 32.82
 
   # 스캔 속도 (ms)
   scan-interval-ms: 500
@@ -45,6 +45,7 @@ polymarket:
   api-key: ${POLY_API_KEY:}
   passphrase: ${POLY_PASSPHRASE:}
   api-secret: ${POLY_API_SECRET:}
+  funder: "0xAd88f0298FE9879032868D6Cc294801A6749b3Cd"
 
 logging:
   level:

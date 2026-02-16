@@ -78,6 +78,9 @@ public class SniperScanner {
 
 
 
+    // ⭐ 마스터 스위치 (대시보드에서 ON/OFF)
+    private volatile boolean enabled = false;
+
     // 성과 통계
     private volatile int totalScans = 0;
     private volatile int totalTrades = 0;
@@ -164,6 +167,9 @@ public class SniperScanner {
         totalScans++;
 
         try {
+            // 0. 마스터 스위치 OFF면 스캔 중단
+            if (!enabled) return;
+
             // 1. Chainlink 연결 확인
             if (!chainlink.isConnected()) {
                 addLogThrottled("⚠️", "연결", "Chainlink 미연결");
@@ -479,15 +485,22 @@ public class SniperScanner {
         double mktOdds = isBuyYes ? odds.upOdds() : odds.downOdds();
         String tokenId = isBuyYes ? odds.upTokenId() : odds.downTokenId();
 
-        balanceService.deductBet(ev.betAmount());
-
         OrderService.OrderResult order = orderService.placeOrder(tokenId, ev.betAmount(), mktOdds, "BUY");
+
+        // 실제 배팅 금액 (최소 5토큰 제약 반영)
+        double actualBet = order.actualAmount() > 0 ? order.actualAmount() : ev.betAmount();
+        balanceService.deductBet(actualBet);
+
+        // LIVE: 주문 후 실잔액 재동기화 (1초 대기 후, Polymarket 반영 시간)
+        if (!dryRun) {
+            scanExecutor.schedule(() -> balanceService.refreshIfLive(), 2, TimeUnit.SECONDS);
+        }
 
         Trade trade = Trade.builder()
                 .coin("BTC")
                 .timeframe("5M")
                 .action(action)
-                .betAmount(ev.betAmount())
+                .betAmount(actualBet)
                 .odds(mktOdds)
                 .entryPrice(currentPrice)
                 .openPrice(openPrice)
@@ -511,9 +524,9 @@ public class SniperScanner {
             log.error("DB 저장 실패: {}", e.getMessage());
         }
 
-        log.info("🎯 [{}] {} ${} @ {}¢ | EV+{}% | 가격${} (시초${}) {}% | 모멘텀{}% | {}ms",
+        log.info("🎯 [{}] {} ${} ({}토큰) @ {}¢ | EV+{}% | 가격${} (시초${}) {}% | 모멘텀{}% | {}ms",
                 ev.strategy(),
-                action, String.format("%.2f", ev.betAmount()),
+                action, String.format("%.2f", actualBet), String.format("%.0f", order.actualSize()),
                 String.format("%.0f", mktOdds * 100), String.format("%.1f", ev.ev() * 100),
                 String.format("%.2f", currentPrice), String.format("%.2f", openPrice),
                 String.format("%+.3f", priceDiffPct),
@@ -543,11 +556,26 @@ public class SniperScanner {
 
     // === 대시보드용 통계 API ===
 
+    // === 마스터 스위치 제어 ===
+
+    public boolean isEnabled() { return enabled; }
+
+    public void setEnabled(boolean on) {
+        this.enabled = on;
+        if (on) {
+            addLog("🟢", "시스템", "Sniper ON — 스캔 시작");
+            log.info("🟢 Sniper ON — {} 모드", dryRun ? "DRY-RUN" : "🔴 LIVE");
+        } else {
+            addLog("🔴", "시스템", "Sniper OFF — 스캔 정지");
+            log.info("🔴 Sniper OFF");
+        }
+    }
+
     public SniperStats getStats() {
         double avgScanMs = totalScans > 0 ? (double) totalScanTimeMs / totalScans : 0;
         return new SniperStats(totalScans, totalTrades, wins, losses, recentWinRate,
                 balanceService.getBalance(), avgScanMs, chainlink.isConnected(),
-                dryRun, lastTradedCandleWindow);
+                dryRun, lastTradedCandleWindow, enabled);
     }
 
     public void recordWin() { wins++; }
@@ -583,6 +611,7 @@ public class SniperScanner {
     public record SniperStats(
             int totalScans, int totalTrades, int wins, int losses,
             double winRate, double balance, double avgScanMs,
-            boolean chainlinkConnected, boolean dryRun, int lastTradedCandle
+            boolean chainlinkConnected, boolean dryRun, int lastTradedCandle,
+            boolean enabled
     ) {}
 }

@@ -18,6 +18,13 @@
                      font-family:inherit; font-size:12px; padding:4px 12px; border-radius:4px; transition:all 0.2s; }
         .btn-reset:hover { background:#3a1a1a; border-color:#ff6b6b; }
         .btn-reset:disabled { opacity:0.5; cursor:not-allowed; }
+        .btn-toggle { cursor:pointer; font-family:inherit; font-size:13px; font-weight:bold;
+                      padding:6px 18px; border-radius:6px; transition:all 0.3s; border:2px solid; }
+        .btn-toggle-off { background:#1a1a1a; color:#888; border-color:#444; }
+        .btn-toggle-off:hover { background:#222; border-color:#666; }
+        .btn-toggle-on { background:#1a3a1a; color:#4ade80; border-color:#4ade80; box-shadow:0 0 12px rgba(74,222,128,0.3); animation:glowPulse 2s infinite; }
+        .btn-toggle-on:hover { background:#1a4a1a; }
+        @keyframes glowPulse { 0%,100%{box-shadow:0 0 12px rgba(74,222,128,0.3);} 50%{box-shadow:0 0 20px rgba(74,222,128,0.5);} }
         .status-bar { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; font-size:11px; color:#555; }
         .live-dot { width:6px; height:6px; border-radius:50%; background:#4ade80; display:inline-block; margin-right:4px; animation:blink 1.5s infinite; }
         @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
@@ -82,6 +89,7 @@
 <div class="header">
     <h1>⚡ BTC 5M Sniper</h1>
     <div class="header-right">
+        <button id="toggleBtn" onclick="toggleSniper()" class="btn-toggle btn-toggle-off">⏸ OFF</button>
         <span id="warmupTag" class="mode" style="display:none;background:#1a1a3a;color:#60a5fa;border:1px solid #60a5fa;">⏳ 워밍업</span>
         <span id="modeTag" class="mode mode-dry">🧪 DRY-RUN</span>
         <button id="resetBtn" onclick="resetData()" class="btn-reset">🗑️ 초기화</button>
@@ -205,6 +213,9 @@ function render(d) {
     tag.className = d.dryRun ? 'mode mode-dry' : 'mode mode-live';
     tag.textContent = d.dryRun ? '🧪 DRY-RUN' : '🔴 LIVE';
 
+    // 마스터 스위치 동기화
+    updateToggleBtn(d.enabled);
+
     const wt = $('warmupTag');
     if (d.warmedUp) wt.style.display='none';
     else { wt.style.display='inline-block'; wt.textContent='⏳ 워밍업 중'; }
@@ -320,6 +331,25 @@ function render(d) {
     $('logCount').textContent = logs.length+'줄';
     if(wasAtTop) logPanel.scrollTop=0;
     $('lastUpdate').textContent = new Date().toLocaleTimeString();
+}
+
+function toggleSniper() {
+    const btn=$('toggleBtn'); btn.disabled=true;
+    fetch('/api/toggle',{method:'POST'}).then(r=>r.json()).then(d=>{
+        btn.disabled=false;
+        updateToggleBtn(d.enabled);
+    }).catch(()=>{ btn.disabled=false; });
+}
+
+function updateToggleBtn(on) {
+    const btn=$('toggleBtn');
+    if(on) {
+        btn.className='btn-toggle btn-toggle-on';
+        btn.textContent='\u25B6 ON';
+    } else {
+        btn.className='btn-toggle btn-toggle-off';
+        btn.textContent='\u23F8 OFF';
+    }
 }
 
 function resetData() {
