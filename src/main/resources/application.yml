@@ -1,0 +1,58 @@
+server:
+  port: 8090  # poly_bug(8080)과 동시 실행 가능
+
+spring:
+  application:
+    name: poly-sniper
+  datasource:
+    url: jdbc:h2:file:./sniper-db;AUTO_SERVER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+  h2:
+    console:
+      enabled: true
+      path: /h2
+
+# === 트레이딩 설정 ===
+sniper:
+  # DRY-RUN / LIVE 스위칭
+  dry-run: true
+  initial-balance: 50.0
+
+  # 스캔 속도 (ms)
+  scan-interval-ms: 500
+
+  # EV 임계값
+  min-ev: 0.10
+  min-gap: 0.06
+
+  # 배팅 한도
+  min-bet: 1.0
+  max-bet: 10.0
+
+  # 쿨다운 (ms)
+  cooldown-ms: 60000
+
+  # 오즈 캐시 TTL (ms)
+  odds-cache-ttl-ms: 500
+
+  # HTTP 타임아웃 (ms)
+  http-timeout-ms: 2000
+
+# === Polymarket API (LIVE 모드용) ===
+polymarket:
+  private-key: ${POLY_PRIVATE_KEY:}
+  api-key: ${POLY_API_KEY:}
+  passphrase: ${POLY_PASSPHRASE:}
+  api-secret: ${POLY_API_SECRET:}
+
+logging:
+  level:
+    com.sniper.btc: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{20} - %msg%n"
