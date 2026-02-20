@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>⚡ BTC 5M Sniper</title>
+    <title>⚡ POLY - Sniper ( BTC 5M )</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
@@ -82,7 +82,7 @@
 <body>
 
 <div class="status-bar">
-    <span><span class="live-dot"></span> 실시간 (1초)</span>
+    <span><span class="live-dot"></span> 실시간 (500ms)</span>
     <span id="lastUpdate">—</span>
 </div>
 
@@ -100,7 +100,11 @@
     <div class="price-item"><div class="label"><span id="clDot" class="dot dot-off"></span> Chainlink</div><div class="val gold" id="btcPrice">$0.00</div></div>
     <div class="price-item"><div class="label">5M 시초가</div><div class="val" id="btcOpen">$0.00</div></div>
     <div class="price-item"><div class="label">변동</div><div class="val" id="priceDiff">0.000%</div></div>
-    <div class="price-item"><div class="label">평균 스캔</div><div class="val blue" id="avgScan">0.0ms</div></div>
+    <div class="price-item"><div class="label">⚡ 스캔 속도</div><div class="val cyan" id="scansPerSec">0/s</div></div>
+    <div class="price-item"><div class="label">마지막 스캔</div><div class="val blue" id="lastScanTime">0µs</div></div>
+    <div class="price-item"><div class="label">필터</div><div class="val" id="lastFilter" style="color:#888;font-size:13px;">-</div></div>
+    <div class="price-item"><div class="label">📊 ATR</div><div class="val cyan" id="atrDisplay" style="font-size:13px;">-</div></div>
+    <div class="price-item"><div class="label">오즈 캐시</div><div class="val" id="oddsCacheAge" style="color:#888;font-size:13px;">-</div></div>
     <div class="price-item"><div class="label">총 스캔</div><div class="val" id="totalScans" style="color:#888;">0</div></div>
 </div>
 
@@ -109,7 +113,7 @@
     <div class="bankroll-grid">
         <div class="bankroll-card"><div class="lbl">시작 자금</div><div class="num white" id="initBal">$50.00</div></div>
         <div class="bankroll-card highlight"><div class="lbl">💎 총 자산 (잔액+배팅)</div><div class="num cyan" id="totalAssets">$50.00</div><div class="sub" id="assetsSub">잔액 $50.00 + 배팅 $0.00</div></div>
-        <div class="bankroll-card"><div class="lbl">가용 잔액</div><div class="num gold" id="balance">$50.00</div></div>
+        <div class="bankroll-card"><div class="lbl">🟢 Polymarket 실잔액</div><div class="num gold" id="liveBalance">$0.00</div><div class="sub" id="liveSyncAge" style="color:#555">—</div></div>
         <div class="bankroll-card"><div class="lbl">수익률</div><div class="num" id="roi">0.0%</div></div>
         <div class="bankroll-card"><div class="lbl">손익</div><div class="num" id="totalPnl">$0.00</div></div>
     </div>
@@ -141,7 +145,7 @@
     <table><thead><tr>
         <th>시간</th><th>전략</th><th>방향</th><th>배팅</th><th>오즈</th>
         <th>시초가</th><th>진입가</th><th>종가</th><th>EV</th>
-        <th>결과</th><th>P&amp;L</th><th>속도</th>
+        <th>체결</th><th>결과</th><th>P&amp;L</th><th>속도</th>
     </tr></thead><tbody id="tradeBody"></tbody></table>
 </div>
 
@@ -235,8 +239,7 @@ function render(d) {
     const diffEl = $('priceDiff');
     diffEl.textContent = (diff>=0?'+':'') + fmt(diff,3) + '%';
     diffEl.className = 'val ' + (diff>=0?'green':'red');
-    $('avgScan').textContent = fmt(d.avgScanMs,1) + 'ms';
-    $('totalScans').textContent = (d.totalScans||0).toLocaleString();
+    // totalScans, avgScan → /api/scan 에서 500ms로 갱신
 
     // 뱅크롤
     const initBal = d.initialBalance || 50;
@@ -247,7 +250,15 @@ function render(d) {
     $('initBal').textContent = fmtMoney(initBal);
     $('totalAssets').textContent = fmtMoney(assets);
     $('assetsSub').textContent = '잔액 '+fmtMoney(bal)+' + 배팅 '+fmtMoney(pending);
-    $('balance').textContent = fmtMoney(bal);
+    const liveBal = d.liveBalance || bal;
+    const syncAge = d.liveSyncAgeSec;
+    $('liveBalance').textContent = fmtMoney(liveBal);
+    if (syncAge >= 0) {
+        $('liveSyncAge').textContent = syncAge + '초 전 동기화';
+        $('liveSyncAge').style.color = syncAge < 15 ? '#4ade80' : syncAge < 30 ? '#f7931a' : '#f87171';
+    } else {
+        $('liveSyncAge').textContent = 'DRY-RUN';
+    }
     const roiEl = $('roi');
     roiEl.textContent = (roi>=0?'+':'')+fmt(roi,1)+'%';
     roiEl.className = 'num '+(roi>=0?'green':'red');
@@ -295,10 +306,15 @@ function render(d) {
     trades.forEach((t,i) => {
         const nr = isNew&&i===0 ? ' class="new-row"' : '';
         const dc = t.action==='BUY_YES'?'badge-yes':'badge-no';
-        const dt = t.action==='BUY_YES'?'▲ YES':'▼ NO';
+        const dt = t.action==='BUY_YES'?'▲ UP':'▼ DOWN';
         let rh = t.result==='WIN'?'<span class="badge badge-win">WIN</span>':
                   t.result==='LOSE'?'<span class="badge badge-lose">LOSE</span>':
                   '<span class="badge badge-pending">⏳</span>';
+        let os = (t.orderStatus||'').toUpperCase();
+        let oh = os==='MATCHED'?'<span class="badge badge-win">✅ 체결</span>':
+                 os==='LIVE'?'<span class="badge badge-pending">🟡 대기</span>':
+                 os==='REJECTED'?'<span class="badge badge-lose">❌ 거부</span>':
+                 '<span style="color:#555">-</span>';
         const pc = t.pnl>=0?'green':'red';
         const pt = t.result==='PENDING'?'—':(t.pnl>=0?'+':'')+'$'+fmt(t.pnl);
         const ex = t.exitPrice>0?'$'+fmt(t.exitPrice):'—';
@@ -308,28 +324,14 @@ function render(d) {
             +'<td><span class="badge '+dc+'">'+dt+'</span></td>'
             +'<td>$'+fmt(t.betAmount)+'</td><td>'+Math.round((t.odds||0)*100)+'¢</td>'
             +'<td>$'+fmt(t.openPrice)+'</td><td>$'+fmt(t.entryPrice)+'</td><td>'+ex+'</td>'
-            +'<td>'+fmt((t.ev||0)*100,1)+'%</td><td>'+rh+'</td>'
+            +'<td>'+fmt((t.ev||0)*100,1)+'%</td><td>'+oh+'</td><td>'+rh+'</td>'
             +'<td class="'+pc+'">'+pt+'</td><td>'+sm+'</td></tr>';
     });
     $('tradeBody').innerHTML = html;
     if (isNew) { $('cardBalance').classList.add('flash'); setTimeout(()=>$('cardBalance').classList.remove('flash'),1000); }
     prevTradeCount = trades.length;
 
-    // 로그
-    const logs = d.logs || [];
-    const logPanel = $('logPanel');
-    const wasAtTop = logPanel.scrollTop <= 10;
-    logPanel.innerHTML = logs.map(line => {
-        let c='#aaa';
-        if(line.includes('🎯'))c='#f7931a'; else if(line.includes('🔍'))c='#60a5fa';
-        else if(line.includes('⏳')||line.includes('⚠'))c='#666'; else if(line.includes('📊'))c='#777';
-        else if(line.includes('⏱'))c='#a78bfa'; else if(line.includes('🔴'))c='#f87171';
-        else if(line.includes('[모멘텀]'))c='#818cf8'; else if(line.includes('[횡보]')||line.includes('[레인지]'))c='#6b7280';
-        else if(line.includes('[캔들]')||line.includes('[스프레드]'))c='#6b7280'; else if(line.includes('[한도]'))c='#d97706';
-        return '<div style="color:'+c+'">'+line.replace(/</g,'&lt;')+'</div>';
-    }).join('');
-    $('logCount').textContent = logs.length+'줄';
-    if(wasAtTop) logPanel.scrollTop=0;
+    // 로그 → /api/scan 에서 500ms로 갱신
     $('lastUpdate').textContent = new Date().toLocaleTimeString();
 }
 
@@ -364,7 +366,70 @@ function resetData() {
     });
 }
 
-update(); setInterval(update, 1000);
+// ⚡ 이중 폴링: 스캔 메트릭+로그 500ms (경량) / 통계+거래 1.5초 (무거움)
+function updateScan() {
+    fetch('/api/scan').then(r=>r.json()).then(s=>{
+        // 스캔 속도
+        $('scansPerSec').textContent = s.scansPerSec + '/s';
+        const us = s.lastScanUs || 0;
+        $('lastScanTime').textContent = us > 1000 ? (us/1000).toFixed(1)+'ms' : us+'µs';
+        $('lastScanTime').style.color = us < 500 ? '#4ade80' : us < 2000 ? '#60a5fa' : '#f7931a';
+        $('totalScans').textContent = (s.totalScans||0).toLocaleString();
+
+        // 필터
+        const f = s.lastFilter || '-';
+        const fe = $('lastFilter');
+        fe.textContent = f;
+        fe.style.color = f.includes('🎯') ? '#f7931a' : f==='변동부족' ? '#555' :
+            f==='캔들쿨다운' ? '#a78bfa' : f==='OFF' ? '#f87171' :
+            f==='워밍업' ? '#60a5fa' : '#888';
+
+        // ATR + 레짐 표시
+        const atrEl = $('atrDisplay');
+        if (s.atrPct > 0) {
+            const minM = s.dynamicMinMove ? s.dynamicMinMove.toFixed(3) : '?';
+            const regime = s.regimeLabel || s.regime || '?';
+            const cusumS = s.cusumTriggered ? '✓' : '—';
+            atrEl.innerHTML = s.atrPct.toFixed(3) + '% ' + regime
+                + ' <span style="color:#888;font-size:11px">진입>' + minM + '% CUSUM' + cusumS + '</span>';
+            // 레짐별 색상
+            const rc = s.regime === 'LOW' ? '#4ade80' : s.regime === 'NORMAL' ? '#22d3ee' :
+                        s.regime === 'HIGH' ? '#f7931a' : '#f87171';
+            atrEl.style.color = rc;
+        } else {
+            atrEl.textContent = '워밍업';
+            atrEl.style.color = '#666';
+        }
+
+        // 오즈 캐시
+        const oa = s.oddsCacheAgeMs;
+        const oc = $('oddsCacheAge');
+        if (oa >= 0) {
+            oc.textContent = oa + 'ms';
+            oc.style.color = oa < 150 ? '#4ade80' : oa < 500 ? '#f7931a' : '#f87171';
+        } else {
+            oc.textContent = '-';
+        }
+
+        // 로그 (빠른 갱신)
+        const logs = s.logs || [];
+        const logPanel = $('logPanel');
+        const wasAtTop = logPanel.scrollTop <= 10;
+        logPanel.innerHTML = logs.map(line => {
+            let c='#aaa';
+            if(line.includes('🎯'))c='#f7931a'; else if(line.includes('🔍'))c='#60a5fa';
+            else if(line.includes('⏳')||line.includes('⚠'))c='#666'; else if(line.includes('📊'))c='#777';
+            else if(line.includes('⏱'))c='#a78bfa'; else if(line.includes('🔴'))c='#f87171';
+            return '<div style="color:'+c+'">'+line.replace(/</g,'&lt;')+'</div>';
+        }).join('');
+        $('logCount').textContent = logs.length+'줄';
+        if(wasAtTop) logPanel.scrollTop=0;
+    }).catch(()=>{});
+}
+
+update(); updateScan();
+setInterval(update, 1500);
+setInterval(updateScan, 500);
 </script>
 </body>
 </html>

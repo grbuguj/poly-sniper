@@ -59,6 +59,12 @@ public class Trade {
     // === 속도 추적 ===
     private Long scanToTradeMs;    // 스캔→배팅 소요시간(ms)
 
+    private String orderStatus;     // MATCHED, LIVE, REJECTED
+    private String orderId;         // Polymarket order ID
+    private Double balanceAtBet;    // 배팅 직후 Polymarket 실잔액 (잔액 변동 판정용)
+    private String tokenId;         // 배팅한 토큰 ID (CTF redeem용)
+    private Double actualSize;      // 실제 체결 토큰 수 (WIN 시 payout = actualSize × $1)
+
     public enum TradeAction { BUY_YES, BUY_NO, HOLD }
     public enum TradeResult { PENDING, WIN, LOSE, CANCELLED }
 }

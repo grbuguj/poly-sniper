@@ -27,7 +27,8 @@ public class ChainlinkPriceService {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final OkHttpClient wsClient = new OkHttpClient.Builder()
             .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(5, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
             .build();
 
     // BTC 실시간 가격
@@ -45,9 +46,21 @@ public class ChainlinkPriceService {
     // 5M 캔들 종가 캐시: boundaryTsSec → closePrice
     private final Map<Long, Double> closeSnapshots = new ConcurrentHashMap<>();
 
-    private WebSocket webSocket;
+    // ⭐ ATR(14) 계산용 5분봉 OHLC 추적
+    private volatile double candleHigh = 0;
+    private volatile double candleLow = Double.MAX_VALUE;
+    private volatile double prevCandleClose = 0;
+    private final Deque<Double> trueRanges = new ConcurrentLinkedDeque<>();
+    private static final int ATR_PERIOD = 14;
+    private volatile double currentATR = 0.0;    // ATR(14) as % of price
+    private volatile double currentATRRaw = 0.0; // ATR(14) in $ terms
+
+    private volatile WebSocket webSocket;
     private final ScheduledExecutorService reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
     private volatile boolean connected = false;
+    private volatile boolean reconnecting = false; // 중복 재연결 방지
+    private volatile int reconnectAttempts = 0;
+    private static final int MAX_RECONNECT_DELAY = 60; // 최대 60초
 
     // ⭐ 워밍업: 첫 5M 경계 전환 전까지 시초가 부정확 → 배팅 금지
     private volatile boolean warmedUp = false;
@@ -55,19 +68,59 @@ public class ChainlinkPriceService {
     @PostConstruct
     public void connect() {
         connectWebSocket();
-        // 재연결 감시 (15초마다)
+        // 재연결 감시 (10초마다) — 좀비 연결 감지 포함
         reconnectExecutor.scheduleAtFixedRate(() -> {
-            if (!connected) {
-                log.warn("🔄 Chainlink WS 재연결 시도...");
-                connectWebSocket();
+            try {
+                if (reconnecting) return; // 재연결 대기 중이면 스킵
+                long ageMs = getPriceAgeMs();
+                if (!connected || ageMs > 30_000) {
+                    // 연결 끊김 or 30초 이상 데이터 없음 (좀비 감지)
+                    if (ageMs > 30_000 && connected) {
+                        log.warn("🧟 좀비 연결 감지! 마지막 데이터 {}초 전 → 강제 재연결", ageMs / 1000);
+                        connected = false;
+                    }
+                    forceReconnect();
+                } else {
+                    reconnectAttempts = 0; // 정상이면 카운터 리셋
+                }
+            } catch (Exception e) {
+                log.error("재연결 감시 에러: {}", e.getMessage());
             }
-        }, 15, 15, TimeUnit.SECONDS);
+        }, 10, 10, TimeUnit.SECONDS);
     }
 
     @PreDestroy
     public void disconnect() {
-        if (webSocket != null) webSocket.close(1000, "shutdown");
+        closeExistingSocket();
         reconnectExecutor.shutdownNow();
+    }
+
+    private void closeExistingSocket() {
+        WebSocket old = webSocket;
+        if (old != null) {
+            try {
+                old.close(1000, "reconnect");
+            } catch (Exception ignored) {}
+            webSocket = null;
+        }
+    }
+
+    private void forceReconnect() {
+        if (reconnecting) return; // 이미 재연결 진행 중
+        reconnecting = true;
+        
+        int delay = Math.min((int) Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
+        // 429 방지: 최소 5초
+        delay = Math.max(delay, 5);
+        reconnectAttempts++;
+        log.warn("🔄 Chainlink WS 재연결 시도 #{} ({}초 후)", reconnectAttempts, delay);
+        
+        closeExistingSocket();
+        
+        reconnectExecutor.schedule(() -> {
+            reconnecting = false;
+            connectWebSocket();
+        }, delay, TimeUnit.SECONDS);
     }
 
     private void connectWebSocket() {
@@ -77,7 +130,9 @@ public class ChainlinkPriceService {
             @Override
             public void onOpen(WebSocket ws, Response response) {
                 connected = true;
-                log.info("✅ Chainlink WS 연결 성공: {}", RTDS_WS_URL);
+                reconnecting = false;
+                reconnectAttempts = 0;
+                log.info("✅ Chainlink WS 연결 성공: {} (시도 리셋)", RTDS_WS_URL);
 
                 // ⭐ poly_bug와 동일한 구독 형식 (검증됨)
                 String subscribeMsg = """
@@ -122,6 +177,10 @@ public class ChainlinkPriceService {
                     latestPrice = value;
                     priceTimestamp = System.currentTimeMillis();
 
+                    // ⭐ ATR용 캔들 고/저 추적
+                    if (value > candleHigh) candleHigh = value;
+                    if (value < candleLow) candleLow = value;
+
                     // 링 버퍼 추가
                     priceRingBuffer.addLast(new double[]{tsSec, value});
                     while (priceRingBuffer.size() > RING_BUFFER_SIZE) {
@@ -139,7 +198,14 @@ public class ChainlinkPriceService {
             @Override
             public void onFailure(WebSocket ws, Throwable t, Response response) {
                 connected = false;
-                log.error("❌ Chainlink WS 끊김: {}", t.getMessage());
+                log.error("❌ Chainlink WS 끊김: {} → 자동 재연결 대기", t.getMessage());
+            }
+
+            @Override
+            public void onClosing(WebSocket ws, int code, String reason) {
+                connected = false;
+                log.warn("⚠️ Chainlink WS 닫히는 중: {} {} → 자동 재연결 대기", code, reason);
+                ws.close(code, reason);
             }
 
             @Override
@@ -170,6 +236,41 @@ public class ChainlinkPriceService {
             if (closePrice > 0) {
                 closeSnapshots.put(boundary, closePrice);
             }
+
+            // ⭐ ATR 계산: True Range = max(H-L, |H-prevClose|, |L-prevClose|)
+            if (candleHigh > 0 && candleLow < Double.MAX_VALUE && closePrice > 0) {
+                double tr;
+                if (prevCandleClose > 0) {
+                    tr = Math.max(candleHigh - candleLow,
+                            Math.max(Math.abs(candleHigh - prevCandleClose),
+                                     Math.abs(candleLow - prevCandleClose)));
+                } else {
+                    tr = candleHigh - candleLow;
+                }
+                trueRanges.addLast(tr);
+                while (trueRanges.size() > ATR_PERIOD) trueRanges.pollFirst();
+
+                // ATR = EMA of True Ranges
+                if (trueRanges.size() >= 3) {
+                    double atrRaw = 0;
+                    double multiplier = 2.0 / (trueRanges.size() + 1);
+                    boolean first = true;
+                    for (double trVal : trueRanges) {
+                        if (first) { atrRaw = trVal; first = false; }
+                        else { atrRaw = (trVal - atrRaw) * multiplier + atrRaw; }
+                    }
+                    currentATRRaw = atrRaw;
+                    currentATR = (atrRaw / closePrice) * 100; // %로 변환
+                    log.info("📊 ATR({}): ${} = {}% (TR개수: {})",
+                            trueRanges.size(), String.format("%.2f", atrRaw),
+                            String.format("%.4f", currentATR), trueRanges.size());
+                }
+                prevCandleClose = closePrice;
+            }
+
+            // ⭐ 새 캔들 고/저 리셋
+            candleHigh = 0;
+            candleLow = Double.MAX_VALUE;
 
             // 새 캔들 시초가
             last5mBoundary = boundary;
@@ -231,4 +332,43 @@ public class ChainlinkPriceService {
     public boolean isConnected() { return connected && getPriceAgeMs() < 10_000; }
 
     public boolean isWarmedUp() { return warmedUp; }
+
+    /** ATR(14) as percentage (e.g., 0.08 = 0.08%) — 0이면 아직 워밍업 중 */
+    public double getATRPct() { return currentATR; }
+
+    /** ATR(14) in USD (e.g., 53.2 = $53.2) */
+    public double getATRRaw() { return currentATRRaw; }
+
+    /** ATR 워밍업 완료 여부 (최소 3개 캔들 필요) */
+    public boolean isATRReady() { return trueRanges.size() >= 3; }
+
+    // =========================================================================
+    // ⭐ 변동성 레짐 감지 (ATR 수준 → 4단계 자동 분류)
+    // 논문: K-means clustering → 간소화 버전 (ATR 구간별 고정 경계)
+    // BTC 5M ATR 실측 기준:
+    //   - LOW:     < 0.04%  (새벽/주말, 거래량 부족)
+    //   - NORMAL:  0.04-0.10% (일반 장중)
+    //   - HIGH:    0.10-0.18% (미국장 오픈, 뉴스)
+    //   - EXTREME: > 0.18% (FOMC, CPI, 급등락)
+    // =========================================================================
+    public enum VolRegime { LOW, NORMAL, HIGH, EXTREME }
+
+    public VolRegime getVolatilityRegime() {
+        if (!isATRReady()) return VolRegime.NORMAL; // 워밍업 중 기본값
+        double atr = currentATR;
+        if (atr < 0.04) return VolRegime.LOW;
+        if (atr < 0.10) return VolRegime.NORMAL;
+        if (atr < 0.18) return VolRegime.HIGH;
+        return VolRegime.EXTREME;
+    }
+
+    /** 레짐 문자열 (대시보드용) */
+    public String getVolatilityRegimeLabel() {
+        return switch (getVolatilityRegime()) {
+            case LOW -> "🟢 LOW";
+            case NORMAL -> "🔵 NORMAL";
+            case HIGH -> "🟠 HIGH";
+            case EXTREME -> "🔴 EXTREME";
+        };
+    }
 }

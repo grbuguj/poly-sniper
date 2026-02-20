@@ -39,6 +39,7 @@ public class ResultChecker {
     private final ChainlinkPriceService chainlink;
     private final BalanceService balanceService;
     private final SniperScanner sniperScanner;
+    private final RedeemService redeemService;
 
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
@@ -47,12 +48,13 @@ public class ResultChecker {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private static final String GAMMA = "https://gamma-api.polymarket.com";
+    private static final String CLOB = "https://clob.polymarket.com";
     private static final ZoneId ET = ZoneId.of("America/New_York");
 
     // Polymarket 정산 결과
     private record MarketResolution(boolean yesWon, boolean resolved) {}
 
-    @Scheduled(fixedDelay = 30000, initialDelay = 15000)
+    @Scheduled(fixedDelay = 5000, initialDelay = 5000)
     public void checkPending() {
         List<Trade> pending = tradeRepository.findByResultOrderByCreatedAtDesc(Trade.TradeResult.PENDING);
         if (pending.isEmpty()) return;
@@ -87,46 +89,135 @@ public class ResultChecker {
             }
 
             // ============================================================
-            // FALLBACK: 10분 초과 & Polymarket 실패 → Chainlink/Binance
+            // SECONDARY: 잔액 변동 판정 (Gamma API 실패 시)
+            //
+            // 🔧 FIX: auto-redeem이 없으면 WIN해도 잔액이 즉시 안 올라감
+            //   → 잔액 증가 시에만 WIN 판정 (확실한 경우)
+            //   → 잔액 미변동은 LOSE로 판정하지 않음 (auto-redeem 미지원)
+            //   → LOSE 판정은 Gamma API에서만
             // ============================================================
-            if (minSinceClose >= 10) {
-                log.warn("⚠️ Trade #{} Polymarket 정산 조회 실패 ({}분 경과) → Chainlink fallback",
-                        trade.getId(), minSinceClose);
+            if (minSinceClose >= 2) {
+                Double balAtBet = trade.getBalanceAtBet();
+                if (balAtBet != null && balAtBet > 0) {
+                    double currentLive = balanceService.getLiveBalance();
+                    double diff = currentLive - balAtBet;
+                    double expectedPayout = trade.getBetAmount() / trade.getOdds();
 
-                double closePrice = resolveDisplayClosePrice(trade, minSinceClose);
-                if (closePrice <= 0) continue;
-
-                Double openPrice = trade.getOpenPrice();
-                if (openPrice == null || openPrice <= 0) {
-                    double binanceOpen = fetchBinanceOpen(trade.getCreatedAt());
-                    if (binanceOpen > 0) {
-                        trade.setOpenPrice(binanceOpen);
-                        openPrice = binanceOpen;
-                    } else {
+                    if (diff > expectedPayout * 0.5) {
+                        // 잔액이 payout의 50%+ 증가 → WIN (확실)
+                        double displayClose = resolveDisplayClosePrice(trade, minSinceClose);
+                        log.info("💰 잔액 변동 WIN 감지: ${} → ${} (+${}, payout ${})",
+                                fmt(balAtBet), fmt(currentLive), fmt(diff), fmt(expectedPayout));
+                        applyResult(trade, true, displayClose > 0 ? displayClose : 0, "BALANCE_CHANGE");
                         continue;
                     }
+
+                    // 🔧 잔액 미변동 → LOSE 판정 안 함 (auto-redeem 미지원)
+                    // Gamma API 정산 결과만 기다림
                 }
+            }
 
-                boolean priceWentUp = closePrice > openPrice;
-                boolean betOnUp = trade.getAction() == Trade.TradeAction.BUY_YES;
-                boolean win = (betOnUp == priceWentUp);
-
-                applyResult(trade, win, closePrice, "CHAINLINK_FALLBACK");
+            // ============================================================
+            // TIMEOUT: 20분 초과 → CANCELLED
+            // 🔧 FIX: 15분 → 20분 (auto-redeem 없이 Gamma API만 사용하므로 여유 확보)
+            // ============================================================
+            if (minSinceClose >= 20) {
+                // 20분 초과: Polymarket 정산 불가 → CANCELLED 처리
+                log.warn("⚠️ Trade #{} Polymarket 정산 20분 초과 → CANCELLED 처리", trade.getId());
+                trade.setResult(Trade.TradeResult.CANCELLED);
+                trade.setResolvedAt(LocalDateTime.now());
+                trade.setPnl(0);
+                // 배팅액 환불 (Polymarket에서 실제 환불됨)
+                balanceService.addWinnings(trade.getBetAmount(), 1.0); // 원금 복구
+                trade.setBalanceAfter(balanceService.getBalance());
+                tradeRepository.save(trade);
+                log.info("🔄 Trade #{} CANCELLED — 배팅액 ${} 환불", trade.getId(), fmt(trade.getBetAmount()));
                 continue;
             }
 
-            // 아직 대기 중
-            if (minSinceClose >= 2 && minSinceClose % 2 == 0) {
-                log.debug("⏳ Trade #{} 정산 대기 중 ({}분 경과)", trade.getId(), minSinceClose);
+            // 아직 대기 중 — Polymarket 정산만 기다림 (대부분 1~3분 내 완료)
+            if (minSinceClose >= 1) {
+                log.info("⏳ Trade #{} Polymarket 정산 대기 중 ({}분 경과, 최대 20분)", trade.getId(), minSinceClose);
             }
         }
     }
 
     /**
      * Polymarket Gamma API에서 마켓 정산 결과 조회
-     * tokens[].winner 필드로 실제 승자 확인
+     *
+     * 🔧 FIX: slug 역산 → conditionId 직접 조회로 변경
+     *   - slug 역산은 시간대/에포크 오차로 실패할 수 있음
+     *   - conditionId는 배팅 시 정확히 저장되므로 100% 매칭
+     *
+     * 조회 순서:
+     *   1. condition_id로 /markets 직접 조회 (PRIMARY)
+     *   2. slug 역산 fallback (conditionId 없는 과거 Trade용)
      */
     private MarketResolution queryPolymarketResolution(Trade trade) {
+        // 1차: conditionId 직접 조회
+        String conditionId = trade.getMarketId();
+        if (conditionId != null && !conditionId.isBlank() && !"unknown".equals(conditionId)) {
+            MarketResolution result = queryByConditionId(conditionId);
+            if (result != null) return result;
+        }
+
+        // 2차: slug 역산 fallback (과거 Trade 호환)
+        return queryBySlug(trade);
+    }
+
+    /**
+     * conditionId로 CLOB API 직접 조회 — 가장 정확한 방법
+     *
+     * 🔧 FIX: Gamma /markets?condition_id= 는 필터링이 안 됨 (전체 마켓 리턴)
+     *   → CLOB /markets/<conditionId> 사용 (conditionId로 직접 조회, 정확한 정산 결과)
+     */
+    private MarketResolution queryByConditionId(String conditionId) {
+        try {
+            String url = CLOB + "/markets/" + conditionId;
+            String json = httpGet(url);
+            if (json == null || json.isBlank()) return null;
+
+            JsonNode mkt = objectMapper.readTree(json);
+
+            // 에러 응답 체크
+            if (mkt.has("error") || mkt.has("type")) {
+                log.debug("CLOB 마켓 조회 실패: {}", conditionId.substring(0, Math.min(10, conditionId.length())));
+                return null;
+            }
+
+            // closed 확인
+            boolean closed = mkt.path("closed").asBoolean(false);
+            if (!closed) return new MarketResolution(false, false); // 아직 미정산
+
+            // tokens 배열에서 winner 확인
+            JsonNode tokens = mkt.path("tokens");
+            if (!tokens.isArray() || tokens.isEmpty()) return null;
+
+            for (JsonNode token : tokens) {
+                boolean winner = token.path("winner").asBoolean(false);
+                if (winner) {
+                    String outcome = token.path("outcome").asText("");
+                    boolean yesWon = outcome.equalsIgnoreCase("Yes")
+                            || outcome.equalsIgnoreCase("Up");
+                    log.info("✅ CLOB 정산: {} 승리 (conditionId={})", outcome,
+                            conditionId.substring(0, Math.min(10, conditionId.length())));
+                    return new MarketResolution(yesWon, true);
+                }
+            }
+
+            // closed=true + winner 없음 → 아직 정산 처리중
+            log.debug("CLOB closed=true but no winner yet: {}", conditionId.substring(0, Math.min(10, conditionId.length())));
+            return null;
+        } catch (Exception e) {
+            log.warn("CLOB conditionId 정산 조회 실패: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * slug 역산 fallback (과거 Trade 호환)
+     */
+    private MarketResolution queryBySlug(Trade trade) {
         try {
             String slug = buildSlugForTrade(trade.getCreatedAt());
             String url = GAMMA + "/events?slug=" + slug;
@@ -139,43 +230,72 @@ public class ResultChecker {
             JsonNode markets = events.get(0).path("markets");
             if (!markets.isArray() || markets.isEmpty()) return null;
 
-            JsonNode mkt = markets.get(0);
-
-            // 마켓 종료 여부 확인
-            boolean closed = mkt.path("closed").asBoolean(false);
-            if (!closed) return new MarketResolution(false, false); // 아직 미정산
-
-            // tokens 파싱 (JSON 배열 또는 문자열)
-            JsonNode tokens = mkt.path("tokens");
-            if (tokens.isTextual()) {
-                tokens = objectMapper.readTree(tokens.asText("[]"));
-            }
-
-            if (!tokens.isArray() || tokens.isEmpty()) {
-                log.debug("tokens 배열 비어있음: slug={}", slug);
-                return null;
-            }
-
-            // winner 필드 확인
-            for (JsonNode token : tokens) {
-                boolean winner = token.path("winner").asBoolean(false);
-                if (winner) {
-                    String outcome = token.path("outcome").asText("");
-                    boolean yesWon = outcome.equalsIgnoreCase("Yes")
-                            || outcome.equalsIgnoreCase("Up");
-                    log.info("✅ Polymarket 정산: {} 승리 (slug={})", outcome, slug);
-                    return new MarketResolution(yesWon, true);
-                }
-            }
-
-            // closed=true인데 winner가 없으면 아직 정산 중일 수 있음
-            log.debug("마켓 closed=true지만 winner 미확정: slug={}", slug);
-            return null;
-
+            return parseMarketResolution(markets.get(0), "slug=" + slug);
         } catch (Exception e) {
-            log.warn("Polymarket 정산 조회 실패: {}", e.getMessage());
+            log.warn("slug 기반 정산 조회 실패: {}", e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * 마켓 JSON에서 정산 결과 파싱 (공통 로직)
+     */
+    private MarketResolution parseMarketResolution(JsonNode mkt, String source) {
+        // 마켓 종료 여부 확인
+        boolean closed = mkt.path("closed").asBoolean(false);
+        if (!closed) return new MarketResolution(false, false); // 아직 미정산
+
+        // tokens 파싱 (JSON 배열 또는 문자열)
+        JsonNode tokens = mkt.path("tokens");
+        if (tokens.isTextual()) {
+            try {
+                tokens = objectMapper.readTree(tokens.asText("[]"));
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        if (!tokens.isArray() || tokens.isEmpty()) {
+            log.debug("tokens 배열 비어있음: {}", source);
+            return null;
+        }
+
+        // winner 필드 확인
+        for (JsonNode token : tokens) {
+            boolean winner = token.path("winner").asBoolean(false);
+            if (winner) {
+                String outcome = token.path("outcome").asText("");
+                boolean yesWon = outcome.equalsIgnoreCase("Yes")
+                        || outcome.equalsIgnoreCase("Up");
+                log.info("✅ Polymarket 정산: {} 승리 ({})", outcome, source);
+                return new MarketResolution(yesWon, true);
+            }
+        }
+
+        // closed=true + winner 없음 → outcomePrices fallback
+        // 일부 마켓은 winner 필드 대신 outcomePrices로 판별 가능
+        String pricesStr = mkt.path("outcomePrices").asText("");
+        if (!pricesStr.isBlank()) {
+            try {
+                JsonNode prices = objectMapper.readTree(pricesStr);
+                if (prices.isArray() && prices.size() >= 2) {
+                    double upPrice = prices.get(0).asDouble(0.5);
+                    double downPrice = prices.get(1).asDouble(0.5);
+                    // 정산 후 가격이 0 또는 1이면 확정
+                    if (upPrice >= 0.99) {
+                        log.info("✅ Polymarket 정산 (outcomePrices): Up 승리 ({})", source);
+                        return new MarketResolution(true, true);
+                    }
+                    if (downPrice >= 0.99) {
+                        log.info("✅ Polymarket 정산 (outcomePrices): Down 승리 ({})", source);
+                        return new MarketResolution(false, true);
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        log.debug("마켓 closed=true지만 winner 미확정: {}", source);
+        return null;
     }
 
     /**
@@ -202,11 +322,36 @@ public class ResultChecker {
         trade.setResolvedAt(LocalDateTime.now());
 
         if (win) {
-            double payout = trade.getBetAmount() / trade.getOdds();
+            // 🔧 FIX: 실제 체결 토큰 수 기반 PnL (슬리피지 반영)
+            // WIN 시 각 토큰 = $1 → payout = actualSize
+            Double actualSize = trade.getActualSize();
+            double payout;
+            if (actualSize != null && actualSize > 0) {
+                payout = actualSize; // 실제 토큰 수 × $1
+            } else {
+                payout = trade.getBetAmount() / trade.getOdds(); // fallback: 이론값
+            }
             double pnl = payout - trade.getBetAmount();
             trade.setPnl(pnl);
             balanceService.addWinnings(trade.getBetAmount(), trade.getOdds());
             sniperScanner.recordWin();
+
+            // 🔧 자동 Redeem: CTF 포지션 → USDC 전환
+            String conditionId = trade.getMarketId();
+            if (redeemService.isConfigured() && conditionId != null && !conditionId.isBlank()) {
+                redeemService.redeemAsync(conditionId, false).thenAccept(result -> {
+                    if (result.isSuccess()) {
+                        log.info("💰 Auto-Redeem 성공: {} → 잔액 곧 반영", result.txHash());
+                    } else if (result.isNoBalance()) {
+                        log.info("📭 이미 Redeem 완료이거나 잔액 없음");
+                    } else {
+                        log.warn("⚠️ Auto-Redeem 실패: {} — 수동 확인 필요", result.message());
+                    }
+                });
+            }
+            // Redeem 후 잔액 반영 폴링
+            balanceService.startRedeemPolling(payout);
+
             log.info("✅ WIN [{}] | {} @ ${} → ${} | +${} | 잔액 ${}",
                     source, trade.getAction(),
                     fmt(trade.getOpenPrice()), fmt(exitPrice),

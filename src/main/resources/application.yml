@@ -22,14 +22,14 @@ spring:
 sniper:
   # DRY-RUN / LIVE 스위칭
   dry-run: false
-  initial-balance: 32.82
+  initial-balance: 80.0
 
   # 스캔 속도 (ms)
-  scan-interval-ms: 500
+  scan-interval-ms: 100
 
   # 배팅 한도
   min-bet: 1.0
-  max-bet: 10.0
+  max-bet: 50.0
 
   # ※ 쿨다운 90초, 최소변동 0.03%, EV임계 8%, 갭임계 6% → poly_bug 동일 하드코딩
 
@@ -46,6 +46,10 @@ polymarket:
   passphrase: ${POLY_PASSPHRASE:}
   api-secret: ${POLY_API_SECRET:}
   funder: "0xAd88f0298FE9879032868D6Cc294801A6749b3Cd"
+  builder:
+    api-key: ${BUILDER_API_KEY:}
+    secret: ${BUILDER_SECRET:}
+    passphrase: ${BUILDER_PASSPHRASE:}
 
 logging:
   level:

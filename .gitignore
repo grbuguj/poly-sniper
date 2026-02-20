@@ -3,6 +3,9 @@
 build/
 !gradle/wrapper/gradle-wrapper.jar
 
+# Maven
+target/
+
 # IDE
 .idea/
 *.iml
@@ -19,3 +22,6 @@ build/
 # Secrets
 .env.sh
 derive_api_key.py
+
+# Python venv (redeem sidecar)
+.venv-redeem/
