@@ -97,11 +97,9 @@ public class SniperScanner {
     // 캔들당 1건 제한
     private volatile int lastTradedCandleWindow = -1;
 
-    // ⚡ FOK 실패 재시도: 즉시 +2틱 슬리피지로 재시도 (다음 스캔 사이클 = 100ms)
-    private static final long FOK_RETRY_COOLDOWN_MS = 0;
-    private volatile long fokRetryCooldownUntil = 0;
-    private volatile int fokRetryCount = 0;           // 같은 캔들 내 재시도 횟수
-    private static final int MAX_FOK_RETRIES = 3;     // 최대 3회 재시도 (최대 +7틱 = 57¢)
+    // ⚡ FOK 재시도: executeTrade 내부 루프에서 처리 (scan 재진입 없음)
+    // MAX_FOK_RETRIES: 최대 3회 재시도, 매회 +2틱, 60¢ 초과 시 포기
+    private static final int MAX_FOK_RETRIES = 3;
 
 
 
@@ -250,17 +248,11 @@ public class SniperScanner {
                 lastFilterHit = "서킷브레이커"; return;
             }
 
-            // 2. 캔들당 1건 체크 + FOK 재시도 쿨다운
+            // 2. 캔들당 1건 체크
             int currentCandleWindow = getCurrentCandleWindow();
             if (currentCandleWindow == lastTradedCandleWindow) {
                 addLogThrottled("⏱️", "쿨다운", "이미 이 캔들에서 배팅 완료");
                 lastFilterHit = "캔들쿨다운"; return;
-            }
-            // FOK 실패 재시도 쿨다운 (10초)
-            if (System.currentTimeMillis() < fokRetryCooldownUntil) {
-                long remain = (fokRetryCooldownUntil - System.currentTimeMillis()) / 1000;
-                addLogThrottled("⏱️", "FOK재시도", String.format("FOK 재시도 중 → +%d틱으로 재전송 (%d/%d회)", (fokRetryCount * 2) + 1, fokRetryCount, MAX_FOK_RETRIES));
-                lastFilterHit = "FOK쿨다운"; return;
             }
 
             // 3. 변동률 계산
@@ -372,9 +364,9 @@ public class SniperScanner {
 
             // 🔧 FIX: 오즈 상한 필터 — 시장이 이미 방향 반영한 경우 스킵
             // 55¢+ = 시장이 55%+ 확률로 봄 → 우리 엣지 없음 + 손익비 불리
-            if (fwdMarketOdds > 0.57) {
+            if (fwdMarketOdds > 0.60) {
                 addLogThrottled("🛡️", "오즈상한",
-                        String.format("%s %.0f¢ > 57¢ → 시장 이미 반영, 손익비 불리 → 스킵",
+                        String.format("%s %.0f¢ > 60¢ → 시장 이미 반영, 손익비 불리 → 스킵",
                                 priceDir, fwdMarketOdds * 100));
                 lastFilterHit = "오즈상한"; return;
             }
@@ -643,8 +635,6 @@ public class SniperScanner {
             rangeMax = Double.MIN_VALUE;
             rangeTicks = 0;
             momentumTicks.clear();
-            fokRetryCount = 0;
-            fokRetryCooldownUntil = 0;
             // ⭐ CUSUM 리셋 (새 캔들 시작)
             cusumPos = 0;
             cusumNeg = 0;
@@ -782,21 +772,27 @@ public class SniperScanner {
 
         totalTrades++;
 
-        OrderService.OrderResult order = orderService.placeOrder(tokenId, adjustedBet, mktOdds, "BUY", fokRetryCount);
+        // ⚡ FOK 즉시 재시도 루프 (필터 재진입 없이 executeTrade 내부에서 처리)
+        // 이유: scan() 전체 필터를 다시 타면 오즈 캐시 갱신으로 오즈상한(57¢)에 걸려 재시도 차단됨
+        OrderService.OrderResult order = null;
+        int retryCount = 0;
+        double retryOdds = mktOdds;
 
-        // 🔧 FOK 실패 → DB 기록 + 재시도 (최대 3회)
-        if (!order.success()) {
-            totalTrades--;
-            fokRetryCount++;
+        for (int attempt = 0; attempt <= MAX_FOK_RETRIES; attempt++) {
+            order = orderService.placeOrder(tokenId, adjustedBet, retryOdds, "BUY", attempt);
 
-            // ⭐ FOK 실패도 DB에 기록 (CANCELLED) — 내일 분석용
+            if (order.success()) break; // ✅ 체결 성공
+
+            retryCount = attempt + 1;
+
+            // ⭐ FOK 실패 DB 기록 (CANCELLED)
             try {
                 Trade fokFail = Trade.builder()
                         .coin("BTC").timeframe("5M")
                         .action(action)
                         .result(Trade.TradeResult.CANCELLED)
                         .betAmount(adjustedBet)
-                        .odds(mktOdds)
+                        .odds(retryOdds)
                         .entryPrice(currentPrice)
                         .openPrice(openPrice)
                         .estimatedProb(ev.estimatedProb())
@@ -807,9 +803,9 @@ public class SniperScanner {
                         .balanceAfter(balanceService.getBalance())
                         .marketId(odds.marketId())
                         .strategy("FOK_FAIL")
-                        .reason(String.format("FOK실패 #%d/%d | %s", fokRetryCount, MAX_FOK_RETRIES, order.error()))
+                        .reason(String.format("FOK실패 #%d/%d | %s", retryCount, MAX_FOK_RETRIES, order.error()))
                         .detail(String.format("retryCount=%d | slippage=+%d틱 | targetOdds=%.0f¢ | momentum=%.2f | error=%s",
-                                fokRetryCount, (fokRetryCount * 2) - 1, mktOdds * 100, getMomentumConsistency(), order.error()))
+                                retryCount, (retryCount * 2) + 1, retryOdds * 100, getMomentumConsistency(), order.error()))
                         .scanToTradeMs(scanMs)
                         .orderStatus("FOK_FAIL")
                         .tokenId(tokenId)
@@ -820,30 +816,48 @@ public class SniperScanner {
                 log.debug("FOK 실패 DB 저장 실패: {}", e.getMessage());
             }
 
-            if (fokRetryCount >= MAX_FOK_RETRIES) {
-                // 3회 소진 → 이 캔들 포기, 다음 캔들에서 재시도
+            if (retryCount >= MAX_FOK_RETRIES) {
+                // 3회 소진 → 이 캔들 포기
                 lastTradedCandleWindow = getCurrentCandleWindow();
-                fokRetryCount = 0;
-                fokRetryCooldownUntil = 0;
-                addLog("❌", "주문실패", String.format("FOK %d회 실패 → 이 캔들 포기 (55¢까지 시도): %s", MAX_FOK_RETRIES, order.error()));
-                log.warn("❌ FOK {}회 연속 실패 → 캔들 포기 (55¢까지 체결 불가)", MAX_FOK_RETRIES);
-            } else {
-                // 재시도 쿨다운 → 캔들 잠금 안 함
-                fokRetryCooldownUntil = System.currentTimeMillis() + FOK_RETRY_COOLDOWN_MS;
-                addLog("⚠️", "주문실패", String.format("FOK 실패 → +%d틱 재시도 (%d/%d회): %s",
-                        (fokRetryCount * 2) + 1, fokRetryCount, MAX_FOK_RETRIES, order.error()));
-                log.info("⚠️ FOK 실패 #{} → +{}틱 재시도: {}", fokRetryCount, (fokRetryCount * 2) + 1, order.error());
+                addLog("❌", "주문실패", String.format("FOK %d회 실패 → 이 캔들 포기: %s", MAX_FOK_RETRIES, order.error()));
+                log.warn("❌ FOK {}회 연속 실패 → 캔들 포기", MAX_FOK_RETRIES);
+                if (!dryRun) {
+                    scanExecutor.schedule(() -> balanceService.refreshIfLive(), 1, TimeUnit.SECONDS);
+                }
+                totalTrades--;
+                return;
             }
-            if (!dryRun) {
-                scanExecutor.schedule(() -> balanceService.refreshIfLive(), 1, TimeUnit.SECONDS);
+
+            // ⚡ 즉시 재시도: +2틱 올려서 다시 주문 (scan 재진입 없음)
+            retryOdds = retryOdds + 0.02;
+            if (retryOdds > 0.60) {
+                // 60¢ 초과하면 손익비 너무 불리 → 포기
+                lastTradedCandleWindow = getCurrentCandleWindow();
+                addLog("❌", "주문실패", String.format("재시도 오즈 %.0f¢ > 60¢ → 손익비 불리, 포기", retryOdds * 100));
+                log.warn("❌ 재시도 오즈 {}¢ > 60¢ → 포기", String.format("%.0f", retryOdds * 100));
+                if (!dryRun) {
+                    scanExecutor.schedule(() -> balanceService.refreshIfLive(), 1, TimeUnit.SECONDS);
+                }
+                totalTrades--;
+                return;
             }
+
+            addLog("⚠️", "FOK재시도", String.format("실패 #%d → %.0f¢로 즉시 재시도 (%d/%d)",
+                    retryCount, retryOdds * 100, retryCount, MAX_FOK_RETRIES));
+            log.info("⚠️ FOK 실패 #{} → {}¢로 즉시 재시도", retryCount, String.format("%.0f", retryOdds * 100));
+
+            // 50ms 대기 (CLOB 서버 부하 방지)
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+        }
+
+        // FOK 전부 실패한 경우 (위 루프에서 return됨, 여기는 성공 케이스만 도달)
+        if (order == null || !order.success()) {
+            totalTrades--;
             return;
         }
 
-        // ✅ 체결 성공 → 캔들 잠금 + FOK 카운터 리셋
+        // ✅ 체결 성공 → 캔들 잠금
         lastTradedCandleWindow = getCurrentCandleWindow();
-        fokRetryCount = 0;
-        fokRetryCooldownUntil = 0;
 
         // 실제 배팅 금액 (최소 5토큰 제약 반영)
         double actualBet = order.actualAmount() > 0 ? order.actualAmount() : adjustedBet;
