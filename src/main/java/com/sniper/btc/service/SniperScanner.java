@@ -304,9 +304,15 @@ public class SniperScanner {
 
             // ⭐ poly_bug 동일: 캔들 포지션 필터 (position 1-3만)
             int candlePos = getCandlePosition();
-            if (candlePos < 0) {
-                addLogThrottled("📊", "캔들", "마감 15초 차단");
-                lastFilterHit = "캔들마감"; return;
+            if (candlePos <= 0) {
+                if (candlePos == 0) {
+                    addLogThrottled("⏳", "시초가대기", "시초가 동기화 대기 (5초 미만)");
+                    lastFilterHit = "시초가대기";
+                } else {
+                    addLogThrottled("📊", "캔들", "마감 15초 차단");
+                    lastFilterHit = "캔들마감";
+                }
+                return;
             }
 
             // 4. 오즈 조회
@@ -454,13 +460,15 @@ public class SniperScanner {
 
     // =========================================================================
     // ⭐ 캔들 포지션 + 티어드 조기진입
-    // 0초~: T1/T2 조건 충족 시 즉시 진입 (하드블록 없음)
+    // 0~4초: ❌ 하드블록 (시초가 동기화 대기 — Chainlink WS ~1초 지연)
+    // 5초~: T1/T2 조건 충족 시 조기진입
     // 40초~: 기본 진입 허용
     // 285초~: 마감 차단
     // =========================================================================
     private int getCandlePosition() {
         int elapsed = getCandleElapsedSeconds();
 
+        if (elapsed < 5) return 0;   // 시초가 동기화 대기 (Chainlink ~1초 + 안전마진)
         if (elapsed >= 285) return -1; // 마감 15초 차단 (마켓 정산/교체 구간)
         double pct = (double) elapsed / 300;
         if (pct < 0.30) return 1;

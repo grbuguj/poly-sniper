@@ -151,9 +151,13 @@ public class EvCalculator {
     }
 
     /**
-     * ⭐ Kelly Criterion + 단계적 사이징
-     * 잔액이 시드 이하일 때 보수적 → 성장할수록 공격적
-     * 시드이하: 2% | ~2배: 3% | ~5배: 4% | 5배+: 5%
+     * ⭐ Kelly Criterion + 단계적 사이징 + 오즈 스케일링
+     * 1) 잔액/시드 비율 → 기본 Kelly 티어 결정
+     * 2) 오즈 스케일링: 싼 오즈(30¢)일수록 엣지 크므로 더 과감하게
+     *    배율 = 0.50 / marketOdds (50¢ 기준 정규화)
+     *    30¢ → 1.67x, 40¢ → 1.25x, 50¢ → 1.0x, 55¢ → 0.91x
+     *
+     * 시드이하: 3% | ~2배: 4% | ~5배: 5% | 5배+: 6%
      */
     double calcBetSize(double balance, double ev, double marketOdds) {
         if (ev <= 0) return 0;
@@ -170,13 +174,21 @@ public class EvCalculator {
 
         double safeFraction = kellyFraction * kellyMultiplier;
 
-        // ⭐ 단계적 Kelly: 잔액/시드 비율에 따라 상한 조정
+        // ⭐ 단계적 Kelly: 기본 티어 상향 (2→3%, 3→4%, 4→5%, 5→6%)
         double ratio = balance / initialBalance;
         double maxFraction;
-        if (ratio < 1.0)      maxFraction = 0.02;  // 시드 이하: 생존 모드
-        else if (ratio < 2.0) maxFraction = 0.03;  // ~2배: 안정 모드
-        else if (ratio < 5.0) maxFraction = 0.04;  // ~5배: 성장 모드
-        else                  maxFraction = 0.05;  // 5배+: 공격 모드
+        if (ratio < 1.0)      maxFraction = 0.03;  // 시드 이하: 안정 모드 (was 2%)
+        else if (ratio < 2.0) maxFraction = 0.04;  // ~2배: 성장 모드 (was 3%)
+        else if (ratio < 5.0) maxFraction = 0.05;  // ~5배: 공격 모드 (was 4%)
+        else                  maxFraction = 0.06;  // 5배+: 풀 공격 (was 5%)
+
+        // ⭐ 오즈 스케일링: 싼 오즈 = 높은 엣지 = 더 과감
+        // 50¢ 기준 정규화, 최대 2.0x(25¢), 최소 0.8x(62¢)
+        double oddsScale = clamp(0.50 / marketOdds, 0.80, 2.0);
+        maxFraction = maxFraction * oddsScale;
+
+        // 최종 상한: 어떤 경우에도 잔액의 12% 초과 금지
+        maxFraction = Math.min(maxFraction, 0.12);
 
         safeFraction = clamp(safeFraction, 0.02, maxFraction);
 
